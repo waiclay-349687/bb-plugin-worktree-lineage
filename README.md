@@ -43,7 +43,8 @@ One alignment rule throughout: a child's icon lines up with its parent's text, a
   - Green: finished and you haven't looked yet.
 
   Priority is error › waiting for reply › draft › finished-unread. A running thread gets a thin flowing border instead of a color.
-- **Hover actions in place:** regenerate title, archive, and more. Right-click opens bb's full thread menu.
+- **Hover actions in place:** Settle, regenerate title, archive, and more. Right-click opens bb's full thread menu.
+- **On a phone, everything is in the `⋯` menu.** Touch screens have no hover, so each row ends in a `⋯` button. On a thread it opens bb's thread menu with Settle / Unsettle (and New thread in this worktree) merged in, alongside rename, pin, mark unread, regenerate title, archive and the rest. On a branch it offers New thread in this worktree and Copy safe cleanup command. Tapping `⋯` never opens the thread. bb's own menu items follow bb's language.
 - **Quick filter:** press `/` and type. Results come in three groups: title or branch, mentioned in messages, and archived; the last two come from bb's own search.
 - **Follows any theme.** Colors come only from bb theme variables. On touch screens, buttons are bigger.
 - **Scrolls only vertically.** The list never moves sideways, even on a phone: overflow is clipped and touch gestures only pan up and down.

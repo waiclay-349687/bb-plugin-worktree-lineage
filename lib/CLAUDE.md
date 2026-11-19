@@ -14,6 +14,7 @@ briefing.ts: 纯函数，“全程速览”（交给模型写的那一份）的�
 model-run.ts: host 端 I/O，runModel 按 route 分派：gateway 走 runGateway（fetch 一次 OpenAI 兼容 /v1/chat/completions，reasoning_effort low，45s 超时，取 choices[0].message.content 并去掉 <think> 块；连不上 / 超时 / 非 2xx / 无正文都返回 failed；429 附模型级冷却 = Retry-After（秒数或 HTTP 日期，parseRetryAfter；缺省 15 分钟、最多 2 小时，rateLimitCooldownMs），连不上附网关级 60 秒冷却），claude 用 spawn 一次性调用本机 `claude -p`（不加载设置与钩子、不保存会话、不带工具、空临时目录、120s 超时）；返回 ok / failed，从不抛出；记住冷却、按模型链回退由 briefings.ts 决定
 motion.ts: 纯函数动效状态机与 FLIP 计算。reconcilePresence / finishEntering / finishExiting 管理列表条目的 entering / present / exiting 阶段并区分“归档消失”与“跨区迁移”；computeFlipDeltas 做祖先位移抵消（避免分区与子行双倍位移）；flipDuration 按位移距离缩放 190–280ms；parseTranslateOffset 解析打断中的 transform 偏移
 i18n.ts: 纯数据 + 纯函数的界面语言层。resolveLanguage（auto / en / zh → en | zh，按传入顺序取第一个非空的宿主语言标签，zh* 为中文）、MESSAGES（en 与 zh 两本同构词典，界面与设置面板全部文案；带参数的项是函数）、agoText（多久以前）、relativeTime（now / 5m / 3h / 2d / 3w 与 刚刚 / 5分钟 / 3小时 / 2天 / 3周）、SETTINGS_TEXT 与 LANGUAGE_OPTION_LABELS（设置页文案，固定英文；语言名用各自的文字）、LANGUAGE_STORAGE_KEY（前端镜像设置值的本地存储键）
+row-menu.ts: 纯函数行操作菜单。settleMode（这一行给 Settle、Unsettle 还是都不给：架子里始终 Unsettle，主列表只有未置顶的空闲 / 完成未读给 Settle；桌面悬停与手机菜单共用）、threadMenuItems（并进 bb 线程菜单的插件项，key 带 worktree-lineage/ 前缀，分组 1_open / 2_organize）、branchMenuItems（分支行菜单：在此新建、复制清理命令，命令放 detail）、MENU_ICONS（app.tsx 注册给宿主的图标名）
 utils.ts: cn 类名合并、路径显示
 
 ## 边界

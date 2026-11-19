@@ -1614,3 +1614,56 @@
   color: var(--destructive, var(--attention));
   font-size: var(--text-xs, 0.75rem);
 }
+
+/* ── 手机行操作菜单（紧凑 / 触屏）：对话行与分支行行尾常驻的 ⋯ ───────────
+   按钮比别的紧凑按钮小一档，不挤标题；菜单渲染到 body，用宿主的浮层颜色，行高按手指算 */
+.wl-root[data-compact="true"] .wl-row-menu {
+  flex: none;
+  width: 28px;
+  height: 28px;
+  margin-right: -4px;
+}
+.wl-menu {
+  z-index: 60;
+  min-width: 220px;
+  max-width: min(320px, calc(100vw - 16px));
+  padding: 4px;
+  border: 1px solid color-mix(in oklab, var(--ink, currentColor) 12%, transparent);
+  border-radius: var(--radius, 0.5rem);
+  background: var(--popover, var(--canvas));
+  color: var(--popover-foreground, inherit);
+  box-shadow: 0 8px 28px color-mix(in oklab, var(--ink, currentColor) 18%, transparent);
+  -webkit-user-select: none;
+  user-select: none;
+}
+.wl-menu-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  min-height: 44px;
+  padding: 10px;
+  border-radius: calc(var(--radius, 0.5rem) - 2px);
+  font-size: var(--text-sm, 0.875rem);
+  outline: none;
+  cursor: default;
+}
+.wl-menu-item[data-highlighted] {
+  background: color-mix(in oklab, var(--ink, currentColor) 8%, transparent);
+}
+.wl-menu-item > svg,
+.wl-menu-item > span:first-child {
+  flex: none;
+  margin-top: 1px;
+}
+.wl-menu-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.wl-menu-detail {
+  color: var(--muted-foreground);
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: var(--text-xs, 0.75rem);
+  overflow-wrap: anywhere;
+}

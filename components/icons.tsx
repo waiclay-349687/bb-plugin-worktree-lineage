@@ -1,7 +1,7 @@
 /**
  * [INPUT]: 无外部依赖（内联 SVG，颜色取 currentColor）
- * [OUTPUT]: 对外提供 Glyph: 本插件自绘的一组 16 格线性图标
- * [POS]: components 的图标集; 消费者: components/lineage-list.tsx、components/peek.tsx; 自绘而不用宿主图标表，是因为宿主表不含完整 lucide，缺名会回退成闪电
+ * [OUTPUT]: 对外提供 Glyph: 本插件自绘的一组 16 格线性图标; glyphIcon(name): 把一个图形包成按 className 定尺寸的组件，供 app.tsx 注册成宿主图标（行操作菜单只认图标名）
+ * [POS]: components 的图标集; 消费者: components/lineage-list.tsx、components/peek.tsx、app.tsx（注册菜单图标）; 自绘而不用宿主图标表，是因为宿主表不含完整 lucide，缺名会回退成闪电
  * [PROTOCOL]: 变更时更新此头部,然后检查所在目录 CLAUDE.md
  */
 import type { ReactNode } from "react";
@@ -109,4 +109,17 @@ export function Glyph({ name, size = 14, className }: { name: GlyphName; size?: 
       {PATHS[name]}
     </svg>
   );
+}
+
+/** 注册给宿主的图标：宿主按 className 定尺寸、用 currentColor 着色（菜单里的项只认图标名） */
+export function glyphIcon(name: GlyphName) {
+  function RegisteredGlyph({ className }: { className?: string }) {
+    return (
+      <svg viewBox="0 0 16 16" className={className ?? "size-4"} fill="none" stroke="currentColor" strokeWidth={1.5} strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+        {PATHS[name]}
+      </svg>
+    );
+  }
+  RegisteredGlyph.displayName = `Glyph(${name})`;
+  return RegisteredGlyph;
 }
