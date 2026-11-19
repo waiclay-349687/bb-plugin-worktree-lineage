@@ -345,34 +345,142 @@
 
 /* ── 树形列表：两个视图共用 ───────────────────────────────
    对齐只有一条规则：下一级的图标对齐上一级文字的左缘。
-   一级 = 16px 图标 + 7px 间距 = 23px；嵌套层数写在 --wl-depth 上（由组件给），行的缩进和连线的位置都由它算。
-   行是通栏的（悬停底色不随缩进变窄），缩进只是行内的左内边距。 */
+   一级 = 16px 图标 + 7px 间距 = 23px；嵌套层数写在 --wl-depth 上（由组件给），行的左缩进和连线的位置都由它算。
+   子行用 margin-left 缩进（而非 padding-left），让流光描边、选中浮板、状态底色都停在拐线右侧，不包住也不穿过拐线。 */
 .wl-tree {
   --wl-step: 23px;
 }
 .wl-tree > li {
   position: relative;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: 1fr;
   /* 行距用内边距而不是 gap：这样每个 li 首尾相接，竖线才连得上 */
   padding-bottom: 2px;
 }
+.wl-item-clip {
+  min-width: 0;
+  min-height: 0;
+}
+/* 跨区飞跃（置顶 / 取消置顶）时临时抬高层级，飞过其他行时不穿模 */
+[data-flipping="true"] {
+  position: relative;
+  z-index: 5;
+}
+/* 新行入场：先挂在 0fr 高度，下一帧平滑撑开并淡入，下方行自然让位 */
+.wl-tree > li[data-motion="enter-from"] {
+  grid-template-rows: 0fr;
+  padding-bottom: 0;
+}
+.wl-tree > li[data-motion="enter-from"] > .wl-item-clip {
+  overflow: hidden;
+  opacity: 0;
+  transform: translateY(-4px);
+}
+.wl-tree > li[data-motion="entering"] {
+  grid-template-rows: 1fr;
+  padding-bottom: 2px;
+  transition:
+    grid-template-rows 0.22s var(--wl-ease-in),
+    padding-bottom 0.22s var(--wl-ease-in);
+}
+.wl-tree > li[data-motion="entering"] > .wl-item-clip {
+  overflow: hidden;
+  opacity: 1;
+  transform: translateY(0);
+  transition:
+    opacity 0.18s ease-out 0.04s,
+    transform 0.22s var(--wl-ease-in);
+}
+/* 归档 / 删除退场：内容先淡出轻移，同时高度收到 0fr，下方行顺滑合拢 */
+.wl-tree > li[data-motion="exiting"] {
+  grid-template-rows: 0fr;
+  padding-bottom: 0;
+  pointer-events: none;
+  transition:
+    grid-template-rows 0.2s var(--wl-ease-in),
+    padding-bottom 0.2s var(--wl-ease-in);
+}
+.wl-tree > li[data-motion="exiting"] > .wl-item-clip {
+  overflow: hidden;
+  opacity: 0;
+  transform: translateX(-8px);
+  transition:
+    opacity 0.14s ease-out,
+    transform 0.16s ease-out;
+}
+.wl-tree[data-nested="true"] > li[data-motion="exiting"]::before,
+.wl-tree[data-nested="true"] > li[data-motion="exiting"]::after {
+  opacity: 0;
+  transition: opacity 0.14s ease-out;
+}
+.wl-tree[data-nested="true"] > li[data-motion="enter-from"]::before,
+.wl-tree[data-nested="true"] > li[data-motion="enter-from"]::after {
+  opacity: 0;
+}
+.wl-tree[data-nested="true"] > li[data-motion="entering"]::before,
+.wl-tree[data-nested="true"] > li[data-motion="entering"]::after {
+  opacity: 1;
+  transition: opacity 0.18s ease-out 0.04s;
+}
+/* 分区容器：置顶区最后一条归档时整区连同 18px 间距一起收到 0，卸载不跳动 */
+.wl-section-wrap {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: 1fr;
+}
+.wl-section-wrap[data-section-exiting="true"] {
+  grid-template-rows: 0fr;
+  margin-bottom: -18px;
+  pointer-events: none;
+  transition:
+    grid-template-rows 0.2s var(--wl-ease-in),
+    margin-bottom 0.2s var(--wl-ease-in);
+}
+.wl-section-clip {
+  min-width: 0;
+  min-height: 0;
+}
+.wl-section-wrap[data-section-exiting="true"] > .wl-section-clip {
+  overflow: hidden;
+  opacity: 0;
+  transition: opacity 0.14s ease-out;
+}
+.wl-section-clip[data-section-enter="true"] > .wl-section-head {
+  animation: wl-in 0.2s var(--wl-ease-in);
+}
 .wl-tree .wl-cell,
 .wl-tree .wl-brow {
-  padding-left: calc(6px + var(--wl-depth, 0) * var(--wl-step));
+  margin-left: calc(var(--wl-depth, 0) * var(--wl-step));
+  padding-left: 6px;
 }
-/* 连线：一条竖线从上一级图标的正下方垂下，在每个下级那一行拐一个圆角伸到它的图标前 */
+/* 子树与上一级行之间留 2px 呼吸间距（与同级行距一致），避免流光边框贴死上一级 */
+.wl-tree[data-nested="true"] {
+  padding-top: 2px;
+}
+/* 分支树里紧跟在对话列表后面的子分支：上一级对话末行已有 2px padding-bottom，不再叠加 */
+.wl-tree + .wl-collapse > .wl-collapse-inner > .wl-tree[data-nested="true"] {
+  padding-top: 0;
+}
+/* 连线：一条竖线从上一级图标的正下方垂下，在每个下级那一行拐一个圆角停在子行左缘外侧，不穿进边框 */
 .wl-tree[data-nested="true"] > li::before {
   content: "";
   position: absolute;
   z-index: 1;
   left: calc(13.5px + (var(--wl-depth) - 1) * var(--wl-step));
   top: 0;
-  width: 12px;
+  width: 9px;
   height: calc(var(--wl-row) / 2);
   box-sizing: border-box;
   border-left: 1px solid var(--wl-line);
   border-bottom: 1px solid var(--wl-line);
   border-bottom-left-radius: 6px;
   pointer-events: none;
+  transition: border-color 0.14s ease;
+}
+.wl-tree[data-nested="true"] > li:first-child::before {
+  top: -2px;
+  height: calc(var(--wl-row) / 2 + 2px);
 }
 /* 竖线穿过除最后一个以外的兄弟；后面还接着别的下级（同一条分支上切出去的分支）时，最后一个也穿过 */
 .wl-tree[data-nested="true"] > li:not(:last-child)::after,
@@ -386,6 +494,33 @@
   width: 1px;
   background: var(--wl-line);
   pointer-events: none;
+  transition: background-color 0.14s ease;
+}
+.wl-tree[data-nested="true"] > li:first-child:not(:last-child)::after,
+.wl-tree[data-nested="true"][data-continues="true"] > li:first-child:last-child::after {
+  top: -2px;
+}
+.wl-tree + .wl-collapse > .wl-collapse-inner > .wl-tree[data-nested="true"] > li:first-child::before {
+  top: 0;
+  height: calc(var(--wl-row) / 2);
+}
+.wl-tree + .wl-collapse > .wl-collapse-inner > .wl-tree[data-nested="true"] > li:first-child:not(:last-child)::after,
+.wl-tree + .wl-collapse > .wl-collapse-inner > .wl-tree[data-nested="true"][data-continues="true"] > li:first-child:last-child::after {
+  top: 0;
+}
+/* 运行中子行：对应拐线带极淡主色呼应流光描边 */
+.wl-tree[data-nested="true"] > li:has(> .wl-item-clip > .wl-cell[data-tone="running"])::before {
+  border-color: color-mix(in oklch, var(--primary) 34%, var(--sidebar));
+}
+/* 悬停 / 选中路径提亮：启用 --wl-line-hot，从上级一路平滑亮到当前行（含深层嵌套与前置兄弟的竖线） */
+.wl-tree[data-nested="true"] > li:has(.wl-cell:hover, .wl-cell[data-active="true"], .wl-brow:hover)::before {
+  border-color: var(--wl-line-hot);
+  z-index: 2;
+}
+.wl-tree[data-nested="true"] > li:has(~ li .wl-cell:hover, ~ li .wl-cell[data-active="true"], ~ li .wl-brow:hover)::after,
+.wl-tree[data-nested="true"][data-continues="true"]:has(~ .wl-collapse .wl-cell:hover, ~ .wl-collapse .wl-cell[data-active="true"], ~ .wl-collapse .wl-brow:hover) > li::after {
+  background: var(--wl-line-hot);
+  z-index: 2;
 }
 
 /* ── 分支名（等宽小字） ───────────────────────────────── */
@@ -810,6 +945,7 @@
 /* 展开 / 收起：高度平滑过渡，内容跟着淡入淡出 */
 .wl-collapse {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   grid-template-rows: 0fr;
   transition: grid-template-rows 0.14s ease-out; /* 收起：快 */
 }
@@ -818,6 +954,7 @@
   transition: grid-template-rows 0.22s var(--wl-ease-in); /* 展开：慢一点、落得稳 */
 }
 .wl-collapse-inner {
+  min-width: 0;
   min-height: 0;
   overflow: hidden;
   opacity: 0;
@@ -825,6 +962,10 @@
 }
 .wl-collapse[data-open="true"] > .wl-collapse-inner {
   opacity: 1;
+}
+/* 展开完成后放开 overflow，跨区置顶滑移与选中投影才不会被分区边界裁切 */
+.wl-collapse[data-open="true"][data-settled="true"] > .wl-collapse-inner {
+  overflow: visible;
 }
 /* 首屏之后才出现的行：新来的、展开出来的、切换排列后的，淡入一次 */
 .wl-arrive {
@@ -986,7 +1127,14 @@
 .wl-peek[data-settled] {
   transition:
     top 0.24s cubic-bezier(0.3, 0.7, 0.2, 1),
-    height 0.24s cubic-bezier(0.3, 0.7, 0.2, 1);
+    height 0.24s cubic-bezier(0.3, 0.7, 0.2, 1),
+    opacity 0.12s ease-out,
+    transform 0.12s ease-out;
+}
+.wl-peek[data-closing="true"] {
+  opacity: 0;
+  transform: translateX(-3px) scale(0.985);
+  pointer-events: none;
 }
 .wl-peek-body,
 .wl-peek-ghost {

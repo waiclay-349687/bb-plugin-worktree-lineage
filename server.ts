@@ -1,11 +1,11 @@
 /**
- * [INPUT]: 依赖 bb.sdk.projects / bb.sdk.environments 读取项目源与 bb 记录的起点分支; 依赖 host.ts 的 scanLineage 在各机器上读 git、writeBriefing 调本机小模型; 依赖 briefings.ts 的速览调度; 依赖 bb.settings 的两项设置
+ * [INPUT]: 依赖 bb.sdk.projects / bb.sdk.environments 读取项目源与 bb 记录的起点分支; 依赖 host.ts 的 scanLineage 在各机器上读 git、writeBriefing 调网关或本机 claude; 依赖 briefings.ts 的速览调度; 依赖 bb.settings 的四项速览设置（开关、网关地址、网关上按顺序尝试的模型列表、兜底的 claude 模型）
  * [OUTPUT]: 对外提供 serverContract.lineage RPC（每个项目的分支血缘扫描结果 + bb 已登记环境路径）与 serverContract.briefing RPC（读一条对话存盘的速览）; 默认导出插件工厂
  * [POS]: 插件服务端汇总层; 消费者: app.tsx、components/peek.tsx; 与 host.ts 的边界: 本文件不执行命令，只负责收集 bb 侧事实、调度 host、缓存; 与 briefings.ts 的边界: 速览何时写、写哪条都在 briefings，这里只接线
  * [PROTOCOL]: 变更时更新此头部,然后检查所在目录 CLAUDE.md
  */
 import type { BbPluginApi } from "@get-bb/plugin-sdk";
-import { createBriefingService } from "./briefings";
+import { createBriefingService, parseModelList, type BriefingSettings } from "./briefings";
 import {
   hostContract,
   serverContract,
@@ -15,6 +15,13 @@ import {
 /** 扫描结果缓存时长：侧边栏轮询频繁，git 扫描不必每次都跑 */
 const CACHE_TTL_MS = 15_000;
 const SCAN_TIMEOUT_MS = 60_000;
+/**
+ * 速览的模型链（按成本优先级）：本机 Magpie 网关上的 workbuddy DeepSeek → 同网关的免费 DeepSeek（额度少）
+ * → 本机 claude 兜底。付费直连的模型不进默认链。
+ */
+const DEFAULT_GATEWAY_URL = "http://127.0.0.1:3425";
+const DEFAULT_GATEWAY_MODELS = ["workbuddy/deepseek-v4.1-flash", "opencode-zen/deepseek-v4.1-flash-free"];
+const DEFAULT_CLAUDE_MODEL = "haiku";
 
 type EnvironmentRecord = {
   id: string;
@@ -46,19 +53,36 @@ export default async function plugin(bb: BbPluginApi) {
     briefingEnabled: {
       type: "boolean",
       label: "用小模型写进展速览",
-      description: "每轮对话结束后，在后台让本机的 Claude 小模型读完整条对话的提要，写一份分阶段的速览，显示在悬停卡片上。关闭后卡片只显示不花额度的摘要。",
+      description: "每轮对话结束后，在后台让小模型读完整条对话的提要，写一份分阶段的速览，显示在悬停卡片上。先按顺序试下面网关上的模型，都不行再用本机的 Claude。关闭后卡片只显示不花额度的摘要。",
       default: true,
+    },
+    briefingGatewayUrl: {
+      type: "string",
+      label: "优先使用的模型网关",
+      description: `OpenAI 兼容网关的地址（默认本机 Magpie ${DEFAULT_GATEWAY_URL}）。网关连不上时冷却 1 分钟、期间直接用本机 Claude。注意：对话提要会发给网关背后的模型服务商。留空则只用本机 Claude。`,
+      default: DEFAULT_GATEWAY_URL,
+    },
+    briefingGatewayModel: {
+      type: "string",
+      label: "网关上的模型（按顺序）",
+      description: `网关 /v1/models 列出的模型 id，逗号分隔、按顺序尝试（只写一个也行）：某个模型超时、出错或写得不合格就试下一个，全都不行再用本机 Claude；返回 429 的模型按 Retry-After 冷却（缺省 15 分钟，最多 2 小时），冷却期内跳过。默认 ${DEFAULT_GATEWAY_MODELS.join(", ")}。`,
+      default: DEFAULT_GATEWAY_MODELS.join(", "),
     },
     briefingModel: {
       type: "string",
-      label: "写速览用的模型",
-      description: "传给 claude --model 的名字，默认 haiku。",
-      default: "haiku",
+      label: "兜底用的 Claude 模型",
+      description: `网关上的模型都不可用时传给本机 claude --model 的名字，默认 ${DEFAULT_CLAUDE_MODEL}。`,
+      default: DEFAULT_CLAUDE_MODEL,
     },
   });
-  const briefingSettings = async () => {
+  const briefingSettings = async (): Promise<BriefingSettings> => {
     const values = await settings.get();
-    return { enabled: values.briefingEnabled, model: values.briefingModel.trim() || "haiku" };
+    const gatewayUrl = values.briefingGatewayUrl.trim();
+    return {
+      enabled: values.briefingEnabled,
+      model: values.briefingModel.trim() || DEFAULT_CLAUDE_MODEL,
+      gateway: gatewayUrl ? { baseUrl: gatewayUrl, models: parseModelList(values.briefingGatewayModel, DEFAULT_GATEWAY_MODELS) } : null,
+    };
   };
   const briefings = createBriefingService(
     bb,

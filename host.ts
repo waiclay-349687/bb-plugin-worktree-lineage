@@ -1,7 +1,7 @@
 /**
  * [INPUT]: 依赖 @get-bb/plugin-sdk/host 的 experimental_defineHostEntry、lib/contract.ts 的 hostContract、lib/git-scan.ts 的 scanRepository、lib/model-run.ts 的 runModel
- * [OUTPUT]: 对外提供 host 入口（default export）: 处理 scanLineage（在持有仓库的机器上扫描分支血缘）与 writeBriefing（一次性调用本机的小模型）
- * [POS]: 插件的 host 侧入口（package.json bb.host）; 消费者: bb daemon、server.ts（经 hostContract 调用）; 与 server.ts 的边界: 这里只跑本机命令（只读 git、一问一答的 claude），聚合、缓存、何时生成都在 server
+ * [OUTPUT]: 对外提供 host 入口（default export）: 处理 scanLineage（在持有仓库的机器上扫描分支血缘）与 writeBriefing（按 route 调本机可达的模型网关或一次性的本机 claude）
+ * [POS]: 插件的 host 侧入口（package.json bb.host）; 消费者: bb daemon、server.ts（经 hostContract 调用）; 与 server.ts 的边界: 这里只跑本机命令与本机网络调用（只读 git、一问一答的网关 HTTP 或 claude），聚合、缓存、何时生成、网关失败后回退都在 server
  * [PROTOCOL]: 变更时更新此头部,然后检查所在目录 CLAUDE.md
  */
 import { experimental_defineHostEntry } from "@get-bb/plugin-sdk/host";
@@ -14,7 +14,7 @@ export default experimental_defineHostEntry({
   handlers: {
     // scanRepository 自身兜住所有异常并返回 failed，这里无需再 catch
     scanLineage: (input) => scanRepository(input),
-    // runModel 同样兜住所有异常并返回 failed
+    // runModel 同样兜住所有异常并返回 failed；一次只走 route 指定的一条通道
     writeBriefing: (input) => runModel(input),
   },
 });

@@ -1,22 +1,125 @@
 /**
- * [INPUT]: 依赖 bb.sdk.threads（对话大纲、列表）与 bb.sdk.environments（对话在哪台机器）、bb.events 的 thread.idle / thread.deleted、bb.storage.kv 存盘、调用方注入的 callModel（经 host.ts 的 writeBriefing 调本机小模型）; 依赖 lib/briefing 的提要与解析
- * [OUTPUT]: 对外提供 createBriefingService(bb, callModel, getSettings): { view(threadId), backfill() } — 在后台为每条对话写“全程速览”并存盘；view 给界面一次性取回速览、是否落后、兜底摘要（只读）
- * [POS]: 插件服务端的速览调度; 消费者: server.ts; 与 lib/briefing.ts 的边界: 这里决定“何时写、写哪条、写完存哪”，提示词与输出校验在 briefing; 与 host.ts 的边界: 这里不执行任何命令
+ * [INPUT]: 依赖 bb.sdk.threads（对话大纲、列表）与 bb.sdk.environments（对话在哪台机器）、bb.events 的 thread.idle / thread.deleted、bb.storage.kv 存盘、bb.log 记录命中的通道与跳过 / 失败的网关模型、调用方注入的 callModel（经 host.ts 的 writeBriefing 调网关或本机 claude）; 依赖 lib/briefing 的提要与解析
+ * [OUTPUT]: 对外提供 createBriefingService(bb, callModel, getSettings): { view(threadId), backfill() } — 在后台为每条对话写“全程速览”并存盘；view 给界面一次性取回速览、是否落后、兜底摘要（只读）; generateBriefing(callModel, hostId, request, settings, cooldowns, now): 按顺序试网关模型链（跳过冷却中的）、全不行再兜底本机 claude 的一次生成（不依赖 bb，可单测）; parseModelList: 逗号分隔的有序模型列表; CooldownTable / GatewayStep 类型
+ * [POS]: 插件服务端的速览调度; 消费者: server.ts; 与 lib/briefing.ts 的边界: 这里决定“何时写、写哪条、按什么顺序走哪条通道、哪个网关模型在冷却、写完存哪”，提示词与输出校验在 briefing; 与 host.ts 的边界: 这里不执行任何命令，回退决策在这里、执行在 host
  * [PROTOCOL]: 变更时更新此头部,然后检查项目根 CLAUDE.md
  */
 import type { BbPluginApi } from "@get-bb/plugin-sdk";
-import { BRIEFING_SYSTEM_PROMPT, BRIEFING_VERSION, buildDigest, countAsks, freshness, outlineKey, parseBriefing, storedBriefingSchema, type StoredBriefing } from "./lib/briefing";
+import { BRIEFING_SYSTEM_PROMPT, BRIEFING_VERSION, buildDigest, countAsks, freshness, outlineKey, parseBriefing, storedBriefingSchema, type Briefing, type StoredBriefing } from "./lib/briefing";
 import type { ModelRunResult } from "./lib/model-run";
-import type { BriefingView } from "./lib/contract";
+import type { BriefingView, ModelRoute } from "./lib/contract";
 import { buildRecap, type OutlineItem } from "./lib/search";
 
-/** 把提示词交给某台机器上的小模型；由 server.ts 用 host 客户端实现 */
-export type CallModel = (hostId: string, input: { system: string; prompt: string; model: string }, timeoutMs: number) => Promise<ModelRunResult>;
+/** 按 route 把提示词交给某台机器上的模型；由 server.ts 用 host 客户端实现 */
+export type CallModel = (hostId: string, input: { system: string; prompt: string; route: ModelRoute }, timeoutMs: number) => Promise<ModelRunResult>;
 
 export interface BriefingSettings {
   enabled: boolean;
+  /** 兜底用的本机 claude 模型 */
   model: string;
+  /** 优先使用的 OpenAI 兼容网关与其上按顺序尝试的模型；null = 不走网关，直接用 claude */
+  gateway: { baseUrl: string; models: string[] } | null;
 }
+
+/** 把“逗号分隔的有序模型列表”解析成数组（兼容只写一个模型名、中文逗号与换行）；去重，空则用 fallback */
+export function parseModelList(text: string, fallback: readonly string[]): string[] {
+  const models = [...new Set(text.split(/[,，\n]/).map((model) => model.trim()).filter(Boolean))];
+  return models.length > 0 ? models : [...fallback];
+}
+
+/** host RPC 的超时要比 host 内部的超时长：网关 fetch 45s，claude 进程 120s */
+const GATEWAY_HOST_TIMEOUT_MS = 60_000;
+const CLAUDE_HOST_TIMEOUT_MS = 150_000;
+
+/**
+ * 网关冷却表：键 = host + 网关地址 + 模型（模型位为 * 表示整个网关），值 = 冷却截止时间（ms）。
+ * 冷却中的模型直接跳过，不再反复撞 429、刷日志；过期后自动恢复尝试。只存在内存里，插件重载即清空。
+ */
+export type CooldownTable = Map<string, number>;
+const coolKey = (hostId: string, baseUrl: string, model: string) => `${hostId}|${baseUrl}|${model}`;
+
+/** 网关链上每个没用上的模型留下的一步，供日志追踪 */
+export type GatewayStep =
+  | { model: string; kind: "cooling"; until: number }
+  | { model: string; kind: "failed"; reason: string; cooldownMs: number | null };
+
+export type GenerateOutcome =
+  | {
+      status: "ok";
+      briefing: Briefing;
+      via: ModelRoute["via"];
+      model: string;
+      durationMs: number;
+      costUsd: number | null;
+      /** 命中之前跳过或失败的网关模型（按顺序）；直接命中第一个时为空 */
+      steps: GatewayStep[];
+    }
+  | { status: "failed"; steps: GatewayStep[]; message: string };
+
+/**
+ * 一次生成：按顺序试网关上的模型，冷却中的跳过；某个模型连不上、超时、出错或输出过不了 parseBriefing
+ * 就试下一个；网关全都不行再兜底到本机 claude。只有 claude 也失败才算失败（才计入连续失败、才进重试冷却）。
+ * 429 / 连不上时按 host 给的建议写入冷却表；连不上是网关级冷却，同一轮里后面的模型也随之跳过。
+ */
+export async function generateBriefing(
+  callModel: CallModel,
+  hostId: string,
+  request: { system: string; prompt: string },
+  settings: Pick<BriefingSettings, "model" | "gateway">,
+  cooldowns: CooldownTable = new Map(),
+  now: () => number = Date.now,
+): Promise<GenerateOutcome> {
+  const attempt = async (route: ModelRoute, timeoutMs: number) => {
+    const result = await callModel(hostId, { ...request, route }, timeoutMs).catch(
+      (error): ModelRunResult => ({ status: "failed", message: error instanceof Error ? error.message : String(error) }),
+    );
+    if (result.status !== "ok") return { ok: false as const, reason: result.message, cooldown: result.cooldown };
+    const briefing = parseBriefing(result.text);
+    if (!briefing) return { ok: false as const, reason: `unparseable model output: ${result.text.replace(/\s+/g, " ").slice(0, 120)}`, cooldown: undefined };
+    return { ok: true as const, briefing, durationMs: result.durationMs, costUsd: result.costUsd };
+  };
+  /** 仍在冷却返回截止时间，没有或已过期返回 0（过期的顺手删掉） */
+  const coolingUntil = (key: string) => {
+    const until = cooldowns.get(key) ?? 0;
+    if (until > now()) return until;
+    cooldowns.delete(key);
+    return 0;
+  };
+
+  const steps: GatewayStep[] = [];
+  const succeed = (via: ModelRoute["via"], model: string, hit: { briefing: Briefing; durationMs: number; costUsd: number | null }): GenerateOutcome => ({
+    status: "ok",
+    briefing: hit.briefing,
+    via,
+    model,
+    durationMs: hit.durationMs,
+    costUsd: hit.costUsd,
+    steps,
+  });
+
+  if (settings.gateway) {
+    const { baseUrl, models } = settings.gateway;
+    const gatewayKey = coolKey(hostId, baseUrl, "*");
+    for (const model of models) {
+      const until = Math.max(coolingUntil(gatewayKey), coolingUntil(coolKey(hostId, baseUrl, model)));
+      if (until > 0) {
+        steps.push({ model, kind: "cooling", until });
+        continue;
+      }
+      const hit = await attempt({ via: "gateway", baseUrl, model }, GATEWAY_HOST_TIMEOUT_MS);
+      if (hit.ok) return succeed("gateway", model, hit);
+      const cooldownMs = hit.cooldown && hit.cooldown.ms > 0 ? hit.cooldown.ms : null;
+      if (hit.cooldown && cooldownMs !== null) cooldowns.set(hit.cooldown.scope === "gateway" ? gatewayKey : coolKey(hostId, baseUrl, model), now() + cooldownMs);
+      steps.push({ model, kind: "failed", reason: hit.reason, cooldownMs });
+    }
+  }
+  const hit = await attempt({ via: "claude", model: settings.model }, CLAUDE_HOST_TIMEOUT_MS);
+  if (hit.ok) return succeed("claude", settings.model, hit);
+  return { status: "failed", steps, message: hit.reason };
+}
+
+/** 日志里的时长：不足一分钟写秒，否则写分钟 */
+const span = (ms: number) => (ms < 60_000 ? `${Math.ceil(ms / 1000)}s` : `${Math.ceil(ms / 60_000)}m`);
 
 type ThreadRecord = {
   id: string;
@@ -29,7 +132,6 @@ type ThreadRecord = {
 
 const KEY = (threadId: string) => `briefing:${threadId}`;
 const SPEND_KEY = "briefing-spend";
-const HOST_TIMEOUT_MS = 150_000;
 /** 启动时补写：只管最近活跃的对话，且有上限，避免第一次启用时一口气写几百条 */
 const BACKFILL_WINDOW_MS = 14 * 24 * 60 * 60 * 1000;
 const BACKFILL_LIMIT = 40;
@@ -39,7 +141,7 @@ const DAILY_LIMIT = 300;
 /** 同一条对话在同一进度（大纲指纹相同）上失败后，过这么久才再试 */
 const RETRY_AFTER_MS = 60 * 60 * 1000;
 
-/** 连续失败这么多次就清空队列：多半是本机的 claude 不可用，继续排队只会白花时间和额度 */
+/** 连续失败（网关与 claude 都失败）这么多次就清空队列：多半是本机的 claude 不可用，继续排队只会白花时间和额度 */
 const MAX_CONSECUTIVE_FAILURES = 3;
 
 const today = () => new Date().toISOString().slice(0, 10);
@@ -48,6 +150,7 @@ export function createBriefingService(bb: BbPluginApi, callModel: CallModel, get
   const queue: string[] = [];
   let working = false;
   const failed = new Map<string, { key: string; at: number }>();
+  const cooldowns: CooldownTable = new Map();
   let consecutiveFailures = 0;
 
   async function read(threadId: string): Promise<StoredBriefing | null> {
@@ -111,22 +214,33 @@ export function createBriefingService(bb: BbPluginApi, callModel: CallModel, get
       return;
     }
 
-    const result = await callModel(
+    const outcome = await generateBriefing(
+      callModel,
       environment.hostId,
-      { system: BRIEFING_SYSTEM_PROMPT, prompt: buildDigest(outline.items, { active: false }), model: settings.model },
-      HOST_TIMEOUT_MS,
+      { system: BRIEFING_SYSTEM_PROMPT, prompt: buildDigest(outline.items, { active: false }) },
+      settings,
+      cooldowns,
     );
-    const briefing = result.status === "ok" ? parseBriefing(result.text) : null;
-    if (!briefing) {
+    // 真正撞上的失败才 warn；冷却中的跳过只在结果那一行里带一句，不刷屏
+    for (const step of outcome.steps) {
+      if (step.kind !== "failed") continue;
+      const cooling = step.cooldownMs === null ? "" : `; cooling down ${span(step.cooldownMs)}`;
+      bb.log.warn(`briefing gateway ${step.model} failed for ${threadId}: ${step.reason}${cooling}; trying next`);
+    }
+    const skipped = outcome.steps.flatMap((step) => (step.kind === "cooling" ? [`${step.model} (${span(step.until - Date.now())} left)`] : []));
+    const skippedNote = skipped.length > 0 ? `; skipped while cooling: ${skipped.join(", ")}` : "";
+    if (outcome.status === "failed") {
       failed.set(threadId, { key, at: Date.now() });
       consecutiveFailures += 1;
-      bb.log.warn(`briefing failed for ${threadId}: ${result.status === "ok" ? "unparseable model output" : result.message}`);
+      bb.log.warn(`briefing failed for ${threadId} (claude ${settings.model}): ${outcome.message}${skippedNote}`);
       return;
     }
     failed.delete(threadId);
     consecutiveFailures = 0;
-    await bb.storage.kv.set(KEY(threadId), { ...briefing, version: BRIEFING_VERSION, outlineKey: key, askCount, generatedAt: Date.now() } satisfies StoredBriefing);
-    bb.log.info(`briefing written for ${threadId} (${askCount} asks, ${result.status === "ok" ? `${result.durationMs}ms, $${result.costUsd ?? "?"}` : ""})`);
+    await bb.storage.kv.set(KEY(threadId), { ...outcome.briefing, version: BRIEFING_VERSION, outlineKey: key, askCount, generatedAt: Date.now() } satisfies StoredBriefing);
+    const cost = outcome.costUsd === null ? "" : `, $${outcome.costUsd}`;
+    const fallback = outcome.steps.length > 0 ? " (fallback)" : "";
+    bb.log.info(`briefing written for ${threadId} via ${outcome.via} ${outcome.model}${fallback} (${askCount} asks, ${outcome.durationMs}ms${cost})${skippedNote}`);
   }
 
   /** 一次只写一条：小模型调用走用户的订阅额度，不并发抢占 */

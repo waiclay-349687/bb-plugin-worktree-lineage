@@ -1,10 +1,10 @@
 /**
- * [INPUT]: 依赖 @get-bb/plugin-sdk/app 的侧边栏线程数据、provider 图标、线程快捷操作与菜单、状态组件、导航; 依赖 server.ts 的 lineage RPC; 依赖 lib/tree 建树、lib/conversations（对话视图）与 lib/view（分支树视图）两个展示模型
+ * [INPUT]: 依赖 @get-bb/plugin-sdk/app 的侧边栏线程数据、provider 图标、线程快捷操作与菜单、状态组件、导航; 依赖 server.ts 的 lineage RPC; 依赖 lib/tree 建树、lib/conversations（对话视图）与 lib/view（分支树视图）两个展示模型; 依赖 components/motion 的存在感列表与全局 FLIP 滑移
  * [OUTPUT]: 对外提供 LineageList: experimental_threadList 槽位的列表组件
- * [POS]: 插件界面主体; 消费者: app.tsx; 与 lib 的边界: 谁挂在谁下面、怎么排序由 lib/conversations（对话视图：对话是主角，不出现分支）与 lib/view（分支树视图：分支是主行，对话是次级行）决定，这里只负责渲染与交互（折叠、视图切换、悬停快捷操作、轮询）; 视觉全部在 styles.css，颜色只用宿主主题变量
+ * [POS]: 插件界面主体; 消费者: app.tsx; 与 lib 的边界: 谁挂在谁下面、怎么排序由 lib/conversations（对话视图：对话是主角，不出现分支）与 lib/view（分支树视图：分支是主行，对话是次级行）决定，这里只负责渲染与交互（折叠、视图切换、悬停快捷操作、轮询、入场/退场/重排/置顶动效）; 视觉全部在 styles.css，颜色只用宿主主题变量
  * [PROTOCOL]: 变更时更新此头部,然后检查所在目录 CLAUDE.md
  */
-import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react";
+import { createContext, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react";
 import {
   ThreadTitle,
   experimental_ProviderIcon as ProviderIcon,
@@ -25,10 +25,12 @@ import {
   type PluginSidebarThread,
 } from "@get-bb/plugin-sdk/app";
 import { Glyph } from "@/components/icons";
+import { MotionRow, reducedMotion, useFlipContainer, usePresenceList } from "@/components/motion";
 import { Peek, type PeekTarget } from "@/components/peek";
 import { Icon } from "@/components/ui/icon";
 import { serverContract, type ProjectLineage } from "@/lib/contract";
 import { activityOf, buildConversations, countDescendants, type Conversation } from "@/lib/conversations";
+import type { MotionPhase } from "@/lib/motion";
 import { branchLabel, buildLineageTree, collectAncestry, walkThreads, type BranchView } from "@/lib/tree";
 import { matchThreads } from "@/lib/search";
 import { buildProjectView, pathLabels, relativeTime, rollupTone, rowColor, rowTone, toneOf, type ViewNode } from "@/lib/view";
@@ -97,8 +99,14 @@ interface ListContext {
   compact: boolean;
   view: ViewMode;
   now: number;
-  /** 首屏画完之后才为 true：之后挂载的行（新来的、展开出来的、切换排列的）淡入一次，首屏不闪 */
+  /** 首屏画完之后才为 true：之后的新行撑开、退场收起、重排与置顶滑移才生效，首屏不闪 */
   ready: boolean;
+  /** 当前仍存在于侧边栏的全部对话 id（含置顶与各项目），用于区分“归档消失”和“跨区迁移” */
+  activeIds: ReadonlySet<string>;
+  isRelocated: (threadId: string) => boolean;
+  isNewGlobal: (threadId: string) => boolean;
+  /** 折叠 / 入场 / 退场高度过渡结束后刷新 FLIP 基准坐标 */
+  syncPositions: () => void;
   threadsById: Map<string, Thread>;
   providersById: Map<string, Provider>;
   childCount: Map<string, number>;
@@ -355,6 +363,34 @@ export function LineageList(props: PluginThreadListProps) {
     return () => clearTimeout(timer);
   }, []);
 
+  // 区分“全新对话”和“从别区搬来的对话（置顶/取消置顶）”：knownIdsRef 在 commit 后更新，渲染期始终保存上一帧的全集
+  const activeIds = useMemo(() => new Set(threads.map((t) => t.id)), [threads]);
+  const knownIdsRef = useRef<Set<string> | null>(null);
+  useLayoutEffect(() => {
+    knownIdsRef.current = activeIds;
+  }, [activeIds]);
+  const isRelocated = useCallback((id: string) => activeIds.has(id), [activeIds]);
+  const isNewGlobal = useCallback((id: string) => knownIdsRef.current !== null && !knownIdsRef.current.has(id), []);
+
+  // 顺序 / 归属签名：仅当置顶、项目归属、父子关系、分支路径或排序时间戳变动时才运行 FLIP
+  const placementSig = useMemo(() => {
+    if (filtering) return "filter";
+    const pinPart = pinned.map((t) => t.id).join(",");
+    const orderPart = threads
+      .map((t) => {
+        const running = toneOf(t.indicator) === "running";
+        return `${t.projectId ?? ""}:${t.isPinned ? 1 : 0}:${t.pinSortKey ?? ""}:${t.parentThreadId ?? ""}:${t.environment?.path ?? ""}:${activityOf(t, running)}:${t.id}`;
+      })
+      .join("|");
+    return `${view}#${pinPart}#${orderPart}#${query.data?.generatedAt ?? 0}`;
+  }, [filtering, view, pinned, threads, query.data?.generatedAt]);
+
+  const { syncPositions } = useFlipContainer(rootRef, {
+    enabled: ready && !filtering,
+    skipKey: `${view}:${filtering ? 1 : 0}`,
+    placementSig,
+  });
+
   const ctx: ListContext = {
     activeThreadId: props.activeThreadId,
     onNavigate: props.onNavigate,
@@ -362,6 +398,10 @@ export function LineageList(props: PluginThreadListProps) {
     view,
     now: Date.now(),
     ready,
+    activeIds,
+    isRelocated,
+    isNewGlobal,
+    syncPositions,
     threadsById,
     providersById,
     childCount,
@@ -502,15 +542,7 @@ export function LineageList(props: PluginThreadListProps) {
           </>
         ) : null}
 
-        {!filtering && pinned.length > 0 ? (
-          <Section sectionKey="section:pinned" title="置顶" count={pinned.length}>
-            <ul className="wl-tree">
-              {pinned.map((t) => (
-                <ThreadCell key={t.id} thread={t} />
-              ))}
-            </ul>
-          </Section>
-        ) : null}
+        {!filtering ? <PinnedSection pinned={pinned} /> : null}
 
         {(filtering ? [] : projects).map((project) => {
           const projectThreads = threads.filter((t) => t.projectId === project.id && !t.isPinned);
@@ -528,7 +560,7 @@ export function LineageList(props: PluginThreadListProps) {
             />
           );
         })}
-        {peekTarget && !props.isCompactViewport ? <Peek target={peekTarget} hover={peekHover} /> : null}
+        {!props.isCompactViewport ? <Peek target={peekTarget} hover={peekHover} /> : null}
       </div>
     </Ctx.Provider>
   );
@@ -634,36 +666,78 @@ function HitCell({ hit, quiet = false }: { hit: SearchHit; quiet?: boolean }) {
   );
 }
 
+/** 置顶分区：第一条置顶出现时头部柔和淡入、最后一条归档时整区随行平滑收起 */
+function PinnedSection({ pinned }: { pinned: Thread[] }) {
+  const list = useList();
+  const presence = usePresenceList(pinned, (t) => t.id, {
+    enabled: list.ready,
+    isRelocated: list.isRelocated,
+    isNewGlobal: list.isNewGlobal,
+  });
+  if (presence.entries.length === 0) return null;
+  const exitingAll = pinned.length === 0;
+  return (
+    <Section
+      sectionKey="section:pinned"
+      flipId={exitingAll ? undefined : "section:pinned"}
+      title="置顶"
+      count={pinned.length || undefined}
+      exiting={exitingAll}
+      animateHeader={list.ready}
+    >
+      <ul className="wl-tree">
+        {presence.entries.map((entry) => (
+          <ThreadCell
+            key={entry.key}
+            thread={entry.item}
+            phase={entry.phase}
+            onEntered={() => presence.markEntered(entry.key)}
+            onExited={() => presence.markExited(entry.key)}
+          />
+        ))}
+      </ul>
+    </Section>
+  );
+}
+
 function Section({
   sectionKey,
+  flipId,
   title,
   count,
   note,
   action,
+  exiting = false,
+  animateHeader = false,
   children,
 }: {
   sectionKey: string;
+  flipId?: string;
   title: string;
   count?: number;
   note?: string | null;
   action?: ReactNode;
+  exiting?: boolean;
+  animateHeader?: boolean;
   children: ReactNode;
 }) {
   const list = useList();
   const open = list.isOpen(sectionKey);
   return (
-    <section>
-      <div className="wl-section-head">
-        <button type="button" className="wl-section-toggle" data-open={open} aria-expanded={open} onClick={() => list.toggle(sectionKey)}>
-          <span className="wl-section-name">{title}</span>
-          {count ? <span className="wl-count">{count}</span> : null}
-          {note ? <span className="wl-count">· {note}</span> : null}
-          <Glyph name="chevron" size={10} className="wl-chev" />
-        </button>
-        {action}
-      </div>
-      <Collapse open={open}>{children}</Collapse>
-    </section>
+    <div className="wl-section-wrap" data-flip-id={flipId} data-section-exiting={exiting || undefined}>
+      <section className="wl-section-clip" data-section-enter={animateHeader || undefined}>
+        <div className="wl-section-head">
+          <button type="button" className="wl-section-toggle" data-open={open} aria-expanded={open} onClick={() => list.toggle(sectionKey)}>
+            <span className="wl-section-name">{title}</span>
+            {count ? <span className="wl-count">{count}</span> : null}
+            {note ? <span className="wl-count">· {note}</span> : null}
+            <Glyph name="chevron" size={10} className="wl-chev" />
+          </button>
+          {action}
+        </div>
+        <Collapse open={open}>{children}</Collapse>
+      </section>
+    </div>
   );
 }
 
@@ -674,6 +748,10 @@ interface ProjectActions {
   canStartIn: (node: BranchView<Thread>) => boolean;
   startIn: (node: BranchView<Thread>) => void;
 }
+
+const EMPTY_CONVERSATIONS: Conversation<Thread>[] = [];
+const EMPTY_NODES: ViewNode<Thread>[] = [];
+const EMPTY_LOOSE: { thread: Thread }[] = [];
 
 function ProjectSection({
   projectId,
@@ -700,6 +778,22 @@ function ProjectSection({
     () => (projectView ? null : buildConversations(threads, (t) => toneOf(t.indicator) === "running")),
     [projectView, threads],
   );
+  const convPresence = usePresenceList(conversations ?? EMPTY_CONVERSATIONS, (item) => item.thread.id, {
+    enabled: list.ready && conversations !== null,
+    resetKey: `${list.view}:${projectView ? "tree" : "conv"}`,
+    isRelocated: list.isRelocated,
+    isNewGlobal: list.isNewGlobal,
+  });
+  const rootsPresence = usePresenceList(projectView?.roots ?? EMPTY_NODES, (node) => node.key, {
+    enabled: list.ready && projectView !== null,
+    resetKey: `${list.view}:${projectView ? "tree" : "conv"}`,
+  });
+  const loosePresence = usePresenceList(projectView?.loose ?? EMPTY_LOOSE, (leaf) => leaf.thread.id, {
+    enabled: list.ready && projectView !== null,
+    resetKey: `${list.view}:${projectView ? "tree" : "conv"}`,
+    isRelocated: list.isRelocated,
+    isNewGlobal: list.isNewGlobal,
+  });
 
   const actions = useMemo<ProjectActions>(() => {
     const envIdByPath = new Map((lineage?.environments ?? []).map((e) => [normalizePath(e.path), e.id]));
@@ -727,6 +821,7 @@ function ProjectSection({
   return (
     <Section
       sectionKey={`project:${projectId}`}
+      flipId={`section:project:${projectId}`}
       title={name}
       count={threads.length}
       note={note}
@@ -747,18 +842,38 @@ function ProjectSection({
     >
       {conversations ? (
         <ul className="wl-tree">
-          {conversations.map((item) => (
-            <ConversationItem key={item.thread.id} item={item} />
+          {convPresence.entries.map((entry) => (
+            <ConversationItem
+              key={entry.key}
+              item={entry.item}
+              phase={entry.phase}
+              onEntered={() => convPresence.markEntered(entry.key)}
+              onExited={() => convPresence.markExited(entry.key)}
+            />
           ))}
         </ul>
       ) : projectView ? (
         <>
           <ul className="wl-tree">
-            {projectView.roots.map((node) => (
-              <BranchItem key={node.key} view={node} actions={actions} />
+            {rootsPresence.entries.map((entry) => (
+              <BranchItem
+                key={entry.key}
+                view={entry.item}
+                actions={actions}
+                phase={entry.phase}
+                onEntered={() => rootsPresence.markEntered(entry.key)}
+                onExited={() => rootsPresence.markExited(entry.key)}
+              />
             ))}
-            {projectView.loose.map((leaf) => (
-              <ThreadCell key={leaf.thread.id} thread={leaf.thread} origin />
+            {loosePresence.entries.map((entry) => (
+              <ThreadCell
+                key={entry.key}
+                thread={entry.item.thread}
+                phase={entry.phase}
+                onEntered={() => loosePresence.markEntered(entry.key)}
+                onExited={() => loosePresence.markExited(entry.key)}
+                origin
+              />
             ))}
           </ul>
           <ProjectFoot
@@ -812,14 +927,45 @@ function branchThreads(node: BranchView<Thread>): Thread[] {
  * 分支树视图的一个节点：分支是主行（图标 + 等宽分支名 + 右侧小字标记），它上面的对话是下面的次级行，
  * 从它切出去的分支再缩进一格。对齐只有一条规则：下一级的图标对齐上一级文字的左缘。
  */
-function BranchItem({ view, actions, quiet = false, depth = 0 }: { view: ViewNode<Thread>; actions: ProjectActions; quiet?: boolean; depth?: number }) {
+function BranchItem({
+  view,
+  actions,
+  quiet = false,
+  depth = 0,
+  phase = "present",
+  onEntered,
+  onExited,
+}: {
+  view: ViewNode<Thread>;
+  actions: ProjectActions;
+  quiet?: boolean;
+  depth?: number;
+  phase?: MotionPhase;
+  onEntered?: () => void;
+  onExited?: () => void;
+}) {
   const list = useList();
   const { node } = view;
-  const threads = useMemo(() => branchThreads(node), [node]);
+  const exiting = phase === "exiting";
+  const threads = useMemo(() => {
+    const all = branchThreads(node);
+    // 分支退场时过滤掉只是被置顶迁走的对话，避免与置顶区同时出现两份
+    return exiting ? all.filter((t) => !list.activeIds.has(t.id)) : all;
+  }, [node, exiting, list.activeIds]);
+  const threadPresence = usePresenceList(threads, (t) => t.id, {
+    enabled: list.ready && !exiting,
+    resetKey: list.view,
+    isRelocated: list.isRelocated,
+    isNewGlobal: list.isNewGlobal,
+  });
+  const childrenPresence = usePresenceList(view.children, (child) => child.key, {
+    enabled: list.ready && !exiting,
+    resetKey: list.view,
+  });
   const key = `node:${actions.projectId}:${view.key}`;
   const open = list.isOpen(key);
-  const hasKids = view.children.length > 0;
-  const hidden = hasKids && !open ? view.children.reduce((sum, child) => sum + countThreads(child), 0) : 0;
+  const hasKids = childrenPresence.entries.length > 0;
+  const hidden = view.children.length > 0 && !open ? view.children.reduce((sum, child) => sum + countThreads(child), 0) : 0;
   const tone = rollupTone(threads.map((t) => t.indicator));
   const dim = list.focusSet !== null && !threads.some((t) => list.focusSet!.has(t.id));
   const startHere = node.worktreePath ? { run: () => actions.startIn(node), known: actions.canStartIn(node) } : undefined;
@@ -828,7 +974,13 @@ function BranchItem({ view, actions, quiet = false, depth = 0 }: { view: ViewNod
   const tags = branchTags(node);
 
   return (
-    <li>
+    <MotionRow
+      phase={phase}
+      flipId={`branch:${actions.projectId}:${view.key}`}
+      onEntered={onEntered}
+      onExited={onExited}
+      onSettled={list.syncPositions}
+    >
       <div className="wl-brow" title={nodeTitle(view)} data-dim={dim} data-quiet={quiet || node.merged || undefined} data-ghost={node.worktreePath === null || undefined}>
         <span className="wl-bicon" data-tone={tone ?? undefined}>
           <Glyph name={node.isMain ? "home" : node.branch === null ? "commit" : node.merged ? "merged" : "branch"} size={14} />
@@ -838,27 +990,46 @@ function BranchItem({ view, actions, quiet = false, depth = 0 }: { view: ViewNod
           {leaf}
         </span>
         {tags.length > 0 ? <span className="wl-btags">{tags.join(" · ")}</span> : null}
-        {startHere ? <StartHereButton {...startHere} reveal /> : null}
-        {hasKids ? <FoldButton open={open} hidden={hidden} toggle={() => list.toggle(key)} /> : null}
+        {startHere && !exiting ? <StartHereButton {...startHere} reveal /> : null}
+        {hasKids && !exiting ? <FoldButton open={open} hidden={hidden} toggle={() => list.toggle(key)} /> : null}
       </div>
-      {threads.length > 0 ? (
+      {threadPresence.entries.length > 0 ? (
         // 后面还有切出去的分支时，竖线要穿过最后一条对话接下去
         <ul className="wl-tree" data-nested="true" data-continues={(hasKids && open) || undefined} style={depthStyle(depth + 1)}>
-          {threads.map((thread) => (
-            <ThreadCell key={thread.id} thread={thread} secondary origin focusChip />
+          {threadPresence.entries.map((entry) => (
+            <ThreadCell
+              key={entry.key}
+              thread={entry.item}
+              phase={exiting ? "present" : entry.phase}
+              forceStaticTitle={exiting}
+              onEntered={() => threadPresence.markEntered(entry.key)}
+              onExited={() => threadPresence.markExited(entry.key)}
+              secondary
+              origin
+              focusChip
+            />
           ))}
         </ul>
       ) : null}
       {hasKids ? (
         <Collapse open={open}>
           <ul className="wl-tree" data-nested="true" style={depthStyle(depth + 1)}>
-            {view.children.map((child) => (
-              <BranchItem key={child.key} view={child} actions={actions} quiet={quiet} depth={depth + 1} />
+            {childrenPresence.entries.map((entry) => (
+              <BranchItem
+                key={entry.key}
+                view={entry.item}
+                actions={actions}
+                quiet={quiet}
+                depth={depth + 1}
+                phase={exiting ? "present" : entry.phase}
+                onEntered={() => childrenPresence.markEntered(entry.key)}
+                onExited={() => childrenPresence.markExited(entry.key)}
+              />
             ))}
           </ul>
         </Collapse>
       ) : null}
-    </li>
+    </MotionRow>
   );
 }
 
@@ -925,19 +1096,56 @@ function ProjectFoot({ merged, idle, actions }: { merged: BranchView<Thread>[]; 
  * 对话视图的一个节点：一条对话一行；它派出的对话缩进一格排在下面，用细拐线连着，可以整组收起。
  * 这个视图不出现分支。
  */
-function ConversationItem({ item, depth = 0 }: { item: Conversation<Thread>; depth?: number }) {
+function ConversationItem({
+  item,
+  depth = 0,
+  phase = "present",
+  onEntered,
+  onExited,
+}: {
+  item: Conversation<Thread>;
+  depth?: number;
+  phase?: MotionPhase;
+  onEntered?: () => void;
+  onExited?: () => void;
+}) {
   const list = useList();
   const key = `conv:${item.thread.id}`;
+  const exiting = phase === "exiting";
+  // 父对话退场时过滤掉仍存活的子对话（它们已晋升到顶层，避免双份渲染）
+  const liveChildren = useMemo(
+    () => (exiting ? item.children.filter((c) => !list.activeIds.has(c.thread.id)) : item.children),
+    [exiting, item.children, list.activeIds],
+  );
+  const childPresence = usePresenceList(liveChildren, (c) => c.thread.id, {
+    enabled: list.ready && !exiting,
+    resetKey: list.view,
+    isRelocated: list.isRelocated,
+    isNewGlobal: list.isNewGlobal,
+  });
   const total = countDescendants(item);
   // 默认展开：派出的对话是这一家正在做的事，收起是用户自己的选择
   const open = list.isOpen(key);
   return (
-    <ThreadCell thread={item.thread} fold={total > 0 ? { count: total, open, toggle: () => list.toggle(key) } : undefined}>
-      {total > 0 ? (
+    <ThreadCell
+      thread={item.thread}
+      phase={phase}
+      onEntered={onEntered}
+      onExited={onExited}
+      fold={total > 0 && !exiting ? { count: total, open, toggle: () => list.toggle(key) } : undefined}
+    >
+      {childPresence.entries.length > 0 ? (
         <Collapse open={open}>
           <ul className="wl-tree" data-nested="true" style={depthStyle(depth + 1)}>
-            {item.children.map((child) => (
-              <ConversationItem key={child.thread.id} item={child} depth={depth + 1} />
+            {childPresence.entries.map((entry) => (
+              <ConversationItem
+                key={entry.key}
+                item={entry.item}
+                depth={depth + 1}
+                phase={exiting ? "present" : entry.phase}
+                onEntered={() => childPresence.markEntered(entry.key)}
+                onExited={() => childPresence.markExited(entry.key)}
+              />
             ))}
           </ul>
         </Collapse>
@@ -949,17 +1157,44 @@ function ConversationItem({ item, depth = 0 }: { item: Conversation<Thread>; dep
 /**
  * 带高度动画的展开 / 收起。内容在第一次展开时才挂载；收起动画结束后卸载，
  * 这样收起的对话行不会留在 DOM 里干扰 bb 的行快捷键。
+ * 展开稳定后放开 overflow（data-settled），避免裁切跨区置顶飞跃与选中阴影。
  */
 function Collapse({ open, children }: { open: boolean; children: ReactNode }) {
+  const list = useList();
   const [mounted, setMounted] = useState(open);
-  if (open && !mounted) setMounted(true);
+  const [settled, setSettled] = useState(open);
+  const prevOpen = useRef(open);
+  if (open !== prevOpen.current) {
+    prevOpen.current = open;
+    if (open && !mounted) setMounted(true);
+    if (settled) setSettled(false);
+  }
+  useEffect(() => {
+    if (reducedMotion()) {
+      setMounted(open);
+      setSettled(open);
+      list.syncPositions();
+      return;
+    }
+    const timer = setTimeout(() => {
+      if (open) setSettled(true);
+      else setMounted(false);
+      list.syncPositions();
+    }, 260);
+    return () => clearTimeout(timer);
+  }, [open, list.syncPositions]);
+
   return (
     <div
       className="wl-collapse"
       data-open={open}
+      data-settled={settled || undefined}
       inert={!open}
       onTransitionEnd={(event) => {
-        if (event.target === event.currentTarget && !open) setMounted(false);
+        if (event.target !== event.currentTarget || event.propertyName !== "grid-template-rows") return;
+        if (!open) setMounted(false);
+        else setSettled(true);
+        list.syncPositions();
       }}
     >
       <div className="wl-collapse-inner">{mounted ? children : null}</div>
@@ -1029,6 +1264,10 @@ function ThreadCell({
   focusChip = false,
   origin: showOrigin = false,
   startHere,
+  phase = "present",
+  forceStaticTitle = false,
+  onEntered,
+  onExited,
   children,
 }: {
   thread: Thread;
@@ -1040,6 +1279,10 @@ function ThreadCell({
   focusChip?: boolean;
   origin?: boolean;
   startHere?: { run: () => void; known: boolean };
+  phase?: MotionPhase;
+  forceStaticTitle?: boolean;
+  onEntered?: () => void;
+  onExited?: () => void;
 }) {
   const list = useList();
   const navigate = useBbNavigate();
@@ -1047,6 +1290,7 @@ function ThreadCell({
   const rowStatus = useSidebarThreadRowStatus(thread.id);
   const [hot, setHot] = useState(false);
 
+  const exiting = phase === "exiting" || forceStaticTitle;
   const isActive = list.activeThreadId === thread.id;
   const isFocused = list.focusId === thread.id;
   const dispatched = focusChip ? list.childCount.get(thread.id) ?? 0 : 0;
@@ -1059,8 +1303,8 @@ function ThreadCell({
   const running = toneOf(thread.indicator) === "running";
   const time = relativeTime(activityOf(thread, running), list.now);
   const tone = rowTone(thread.indicator, hasUnsubmittedDraft);
-  // 首屏之后才挂载的行淡入一次
-  const arrive = useRef(list.ready).current;
+  // 搜索结果行保留轻淡入；正常列表行由 MotionRow 高度撑开和全局 FLIP 接管，避免置顶滑移时闪烁
+  const arrive = useRef(sub !== undefined && list.ready).current;
   // 状态变了（比如从运行中变成完成、变成等你回复）时，整行闪一下提示
   const lastTone = useRef(tone);
   const [flash, setFlash] = useState(false);
@@ -1074,7 +1318,13 @@ function ThreadCell({
   }, [tone]);
 
   return (
-    <li>
+    <MotionRow
+      phase={phase}
+      flipId={sub === undefined ? `thread:${thread.id}` : undefined}
+      onEntered={onEntered}
+      onExited={onExited}
+      onSettled={list.syncPositions}
+    >
       <ThreadActionsContextMenu thread={actionTarget(thread)}>
         <div
           className={arrive ? "wl-cell wl-arrive" : "wl-cell"}
@@ -1090,13 +1340,14 @@ function ThreadCell({
           data-split={!isActive && layout !== null}
           data-dim={list.focusSet !== null && !list.focusSet.has(thread.id)}
           onPointerEnter={(event) => {
+            if (exiting) return;
             if (!hot) setHot(true);
             if (event.pointerType === "mouse") list.peekSchedule(thread, event.currentTarget);
           }}
           onPointerLeave={() => list.peekCancel()}
-          onFocus={hot ? undefined : () => setHot(true)}
+          onFocus={hot || exiting ? undefined : () => setHot(true)}
         >
-          {running ? <span className="wl-arc" aria-hidden="true" /> : null}
+          {running && !exiting ? <span className="wl-arc" aria-hidden="true" /> : null}
           <a
             className="wl-cell-link"
             data-sidebar-thread-shortcut-target=""
@@ -1118,7 +1369,7 @@ function ThreadCell({
               {provider ? <ProviderIcon providerKind="agent" provider={provider} className="size-3.5" aria-label={provider.displayName} /> : null}
             </span>
             <span className="wl-title">
-              <ThreadTitle threadId={thread.id} />
+              {exiting ? thread.displayTitle : <ThreadTitle threadId={thread.id} />}
             </span>
             {origin ? (
               <button
@@ -1161,13 +1412,13 @@ function ThreadCell({
             ) : null}
             <span className="wl-tail">
               <span className="wl-slot">{showGlyph ? <ThreadStatusGlyph indicator={indicator} rowStatus={rowStatus} size="compact" /> : time}</span>
-              {hot && !list.compact ? <QuickActions thread={thread} startHere={startHere} /> : null}
+              {hot && !list.compact && !exiting ? <QuickActions thread={thread} startHere={startHere} /> : null}
             </span>
           </div>
           {sub !== undefined ? <div className="wl-line2">{sub}</div> : null}
         </div>
       </ThreadActionsContextMenu>
       {children}
-    </li>
+    </MotionRow>
   );
 }

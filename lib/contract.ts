@@ -1,7 +1,7 @@
 /**
  * [INPUT]: 依赖 @get-bb/plugin-sdk 的 defineRpcContract 与 zod
- * [OUTPUT]: 对外提供 hostContract（host 端契约: scanLineage 读 git、writeBriefing 调本机小模型）、serverContract（app↔server 契约: lineage、briefing）及血缘数据类型
- * [POS]: lib 的契约层; 消费者: host.ts、server.ts、briefings.ts、app.tsx、components/peek.tsx、lib/lineage.ts; 只定义数据形状，不含逻辑
+ * [OUTPUT]: 对外提供 hostContract（host 端契约: scanLineage 读 git、writeBriefing 按 route 调网关或本机 claude，失败可带冷却建议）、modelRouteSchema / ModelRoute（gateway | claude 两条通道）、serverContract（app↔server 契约: lineage、briefing）及血缘数据类型
+ * [POS]: lib 的契约层; 消费者: host.ts、server.ts、briefings.ts、lib/model-run.ts、app.tsx、components/peek.tsx、lib/lineage.ts; 只定义数据形状，不含逻辑; serverContract.briefing 的输出另被 session-cockpit 插件跨插件读取，字段不可随意改
  * [PROTOCOL]: 变更时更新此头部,然后检查所在目录 CLAUDE.md
  */
 import { defineRpcContract } from "@get-bb/plugin-sdk";
@@ -78,6 +78,17 @@ export const scanInputSchema = z.object({
 });
 export type ScanInput = z.infer<typeof scanInputSchema>;
 
+/**
+ * 一次模型调用走哪条通道（都在持有对话的那台机器上）：
+ * - gateway: 纯 HTTP 发给 OpenAI 兼容网关（如本机 Magpie）的 /v1/chat/completions
+ * - claude:  一次性启动本机的 `claude -p`
+ */
+export const modelRouteSchema = z.discriminatedUnion("via", [
+  z.object({ via: z.literal("gateway"), baseUrl: z.string().min(1), model: z.string().min(1) }),
+  z.object({ via: z.literal("claude"), model: z.string().min(1) }),
+]);
+export type ModelRoute = z.infer<typeof modelRouteSchema>;
+
 export const hostContract = defineRpcContract({
   scanLineage: {
     input: scanInputSchema,
@@ -87,12 +98,17 @@ export const hostContract = defineRpcContract({
       z.object({ status: z.literal("failed"), message: z.string() }),
     ]),
   },
-  /** 把一段提示词交给这台机器上的小模型，一问一答，拿回文字 */
+  /** 把一段提示词交给这台机器上的模型，一问一答，拿回文字；走哪条通道由 route 指定，回退由服务端决定 */
   writeBriefing: {
-    input: z.object({ system: z.string().min(1), prompt: z.string().min(1), model: z.string().min(1) }),
+    input: z.object({ system: z.string().min(1), prompt: z.string().min(1), route: modelRouteSchema }),
     output: z.discriminatedUnion("status", [
       z.object({ status: z.literal("ok"), text: z.string(), costUsd: z.number().nullable(), durationMs: z.number() }),
-      z.object({ status: z.literal("failed"), message: z.string() }),
+      z.object({
+        status: z.literal("failed"),
+        message: z.string(),
+        /** 建议暂停多久：model = 只停这个网关模型（429 + Retry-After），gateway = 整个网关连不上 */
+        cooldown: z.object({ scope: z.enum(["model", "gateway"]), ms: z.number() }).optional(),
+      }),
     ]),
   },
 });

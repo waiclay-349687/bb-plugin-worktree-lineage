@@ -112,21 +112,35 @@ export interface PeekHover {
   onLeave: () => void;
 }
 
-export function Peek({ target, hover }: { target: PeekTarget; hover: PeekHover }) {
+const PEEK_EXIT_MS = 130;
+
+export function Peek({ target, hover }: { target: PeekTarget | null; hover: PeekHover }) {
   const rpc = useRpc<typeof serverContract>();
   // 放进 ref：这个引用每次渲染是否稳定由宿主决定，不能让它触发重复请求
   const rpcRef = useRef(rpc);
   rpcRef.current = rpc;
   const latest = useRef(target);
   latest.current = target;
-  const threadId = target.thread.id;
+  const threadId = target?.thread.id ?? null;
+  const updatedAt = target?.thread.updatedAt ?? 0;
   const [shown, setShown] = useState<{ threadId: string; target: PeekTarget; view: BriefingView } | null>(() => {
-    const cached = viewCache.get(threadId);
-    return cached ? { threadId, target, view: cached } : null;
+    if (!target) return null;
+    const cached = viewCache.get(target.thread.id);
+    return cached ? { threadId: target.thread.id, target, view: cached } : null;
   });
   useEffect(() => {
+    if (!threadId) {
+      if (reducedMotion()) {
+        setShown(null);
+        return;
+      }
+      const timer = setTimeout(() => setShown(null), PEEK_EXIT_MS);
+      return () => clearTimeout(timer);
+    }
     let cancelled = false;
-    const show = (view: BriefingView) => !cancelled && setShown({ threadId, target: latest.current, view });
+    const show = (view: BriefingView) => {
+      if (!cancelled && latest.current) setShown({ threadId, target: latest.current, view });
+    };
     const cached = viewCache.get(threadId);
     if (cached) show(cached);
     rpcRef.current
@@ -139,16 +153,18 @@ export function Peek({ target, hover }: { target: PeekTarget; hover: PeekHover }
     return () => {
       cancelled = true;
     };
-  }, [threadId, target.thread.updatedAt]);
+  }, [threadId, updatedAt]);
 
   if (shown === null) return null;
-  // 画的就是鼠标所在的这条：位置、状态跟着最新的 target 走
-  return <PeekCard target={shown.threadId === threadId ? target : shown.target} view={shown.view} hover={hover} />;
+  const closing = target === null;
+  // 画的就是鼠标所在的这条：位置、状态跟着最新的 target 走；关闭中保留最后一条内容淡出
+  const activeTarget = !closing && shown.threadId === threadId ? target : shown.target;
+  return <PeekCard target={activeTarget} view={shown.view} hover={hover} closing={closing} />;
 }
 
 const reducedMotion = () => typeof matchMedia === "function" && matchMedia("(prefers-reduced-motion: reduce)").matches;
 
-function PeekCard({ target, view, hover }: { target: PeekTarget; view: BriefingView; hover: PeekHover }) {
+function PeekCard({ target, view, hover, closing }: { target: PeekTarget; view: BriefingView; hover: PeekHover; closing: boolean }) {
   const { thread } = target;
   const envId = thread.environment?.id ?? null;
   const keys = envId ? [envId] : [];
@@ -225,6 +241,7 @@ function PeekCard({ target, view, hover }: { target: PeekTarget; view: BriefingV
       onPointerLeave={hover.onLeave}
       // 第一次量出高度之前不设高度、不开过渡：卡片直接出现在正确的位置
       data-settled={box !== null || undefined}
+      data-closing={closing || undefined}
       style={{ top: box?.top ?? target.top, left: target.left, height: box?.height }}
       data-bb-portaled-overlay=""
       data-bb-plugin-root=""
