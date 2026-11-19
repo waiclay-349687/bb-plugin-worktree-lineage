@@ -119,9 +119,9 @@ describe("buildProjectView", () => {
 describe("pathLabels / tone", () => {
   it("去掉前缀与 thr 后缀，相邻重名合并", () => {
     const a1 = find(view.roots, "bb/a1-thr_abc123")!;
-    expect(pathLabels(a1.via, a1.node)).toEqual(["d4", "a1"]);
+    expect(pathLabels(a1.via, a1.node, "Detached HEAD")).toEqual(["d4", "a1"]);
     const fake = { ...a1.node, branch: "mobile/a1" };
-    expect(pathLabels([a1.node], fake)).toEqual(["a1"]);
+    expect(pathLabels([a1.node], fake, "Detached HEAD")).toEqual(["a1"]);
   });
 
   it("色调按紧急程度汇总", () => {
@@ -133,13 +133,11 @@ describe("pathLabels / tone", () => {
     expect(rollupTone(["none"])).toBeNull();
   });
 
-  it("相对时间", () => {
+  it("相对时间按语言写：英文 now / 5m / 3h / 2d / 3w，中文 刚刚 / 5分钟 / 3小时 / 2天 / 3周", () => {
     const now = 10 * 24 * 3600_000;
-    expect(relativeTime(now - 20_000, now)).toBe("刚刚");
-    expect(relativeTime(now - 5 * 60_000, now)).toBe("5m");
-    expect(relativeTime(now - 3 * 3600_000, now)).toBe("3h");
-    expect(relativeTime(now - 2 * 24 * 3600_000, now)).toBe("2d");
-    expect(relativeTime(now - 21 * 24 * 3600_000, now)).toBe("3w");
+    const ago = [20_000, 5 * 60_000, 3 * 3600_000, 2 * 24 * 3600_000, 21 * 24 * 3600_000];
+    expect(ago.map((ms) => relativeTime(now - ms, now, "en"))).toEqual(["now", "5m", "3h", "2d", "3w"]);
+    expect(ago.map((ms) => relativeTime(now - ms, now, "zh"))).toEqual(["刚刚", "5分钟", "3小时", "2天", "3周"]);
   });
 });
 

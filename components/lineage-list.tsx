@@ -1,5 +1,5 @@
 /**
- * [INPUT]: 依赖 @get-bb/plugin-sdk/app 的侧边栏线程数据、provider 图标、线程快捷操作与菜单、状态组件、导航; 依赖 server.ts 的 lineage RPC; 依赖 lib/tree 建树、lib/conversations（对话视图）与 lib/view（分支树视图）两个展示模型; 依赖 components/motion 的存在感列表与全局 FLIP 滑移
+ * [INPUT]: 依赖 @get-bb/plugin-sdk/app 的侧边栏线程数据、provider 图标、线程快捷操作与菜单、状态组件、导航; 依赖 server.ts 的 lineage RPC; 依赖 lib/tree 建树、lib/conversations（对话视图）与 lib/view（分支树视图）两个展示模型; 依赖 components/motion 的存在感列表与全局 FLIP 滑移; 依赖 components/i18n 的 LanguageProvider / useT / useLang（全部界面文案按界面语言从词典取）
  * [OUTPUT]: 对外提供 LineageList: experimental_threadList 槽位的列表组件
  * [POS]: 插件界面主体; 消费者: app.tsx; 与 lib 的边界: 谁挂在谁下面、怎么排序由 lib/conversations（对话视图：对话是主角，不出现分支）与 lib/view（分支树视图：分支是主行，对话是次级行）决定，这里只负责渲染与交互（折叠、视图切换、悬停快捷操作、轮询、入场/退场/重排/置顶动效）; 视觉全部在 styles.css，颜色只用宿主主题变量
  * [PROTOCOL]: 变更时更新此头部,然后检查所在目录 CLAUDE.md
@@ -34,6 +34,8 @@ import type { MotionPhase } from "@/lib/motion";
 import { branchLabel, buildLineageTree, collectAncestry, walkThreads, type BranchView } from "@/lib/tree";
 import { matchThreads } from "@/lib/search";
 import { isThreadSettled, needsUserAttention, nextAttentionId, orderByVisual, splitSettledConversations } from "@/lib/settle";
+import type { Messages } from "@/lib/i18n";
+import { LanguageProvider, useLang, useT } from "@/components/i18n";
 import { buildProjectView, pathLabels, relativeTime, rollupTone, rowColor, rowTone, toneOf, worktreeCleanupCommand, type RowColor, type ViewNode } from "@/lib/view";
 
 type Thread = PluginSidebarThread;
@@ -65,12 +67,11 @@ const PEEK_LINGER_MS = 900;
 const PEEK_REOPEN_MS = 700;
 /** 悬停时行尾的快捷按钮，和 bb 自带列表的默认设置一致；其余操作在“更多”与右键菜单里 */
 const QUICK_ACTIONS = ["bb--core/regenerateTitle", "bb--core/archive"] as const;
-const SOURCE_LABEL = {
-  recorded: "bb 记录",
-  reflog: "git 创建记录",
-  "reflog-commit": "git 创建记录（按提交反查）",
-  unknown: "未知",
-} as const;
+/** bb 给这两个操作的名字只有英文：按插件的界面语言换成自己的叫法，别的操作原样显示 */
+const quickActionLabel = (tx: Messages, key: string, fallback: string): string =>
+  key === "bb--core/regenerateTitle" ? tx.regenerateTitle : key === "bb--core/archive" ? tx.archive : fallback;
+const sourceLabel = (tx: Messages, source: "recorded" | "reflog" | "reflog-commit" | "unknown") =>
+  ({ recorded: tx.sourceRecorded, reflog: tx.sourceReflog, "reflog-commit": tx.sourceReflogCommit, unknown: tx.sourceUnknown })[source];
 
 const normalizePath = (p: string) => p.replace(/\/+$/, "");
 
@@ -190,7 +191,18 @@ const useList = () => useContext(Ctx)!;
 
 /** 来路上已经画出的对话：上级就在来路上时不再标注“派自” */
 
+/** 槽位组件：先在根部解析界面语言，整棵列表（含 portal 出去的悬停卡片）都从 Provider 取文案 */
 export function LineageList(props: PluginThreadListProps) {
+  return (
+    <LanguageProvider>
+      <LineageListBody {...props} />
+    </LanguageProvider>
+  );
+}
+
+function LineageListBody(props: PluginThreadListProps) {
+  const tx = useT();
+  const lang = useLang();
   const { threads: allThreads, projects } = useSidebarThreads();
   const { providers } = useProviders();
   const navigate = useBbNavigate();
@@ -415,7 +427,7 @@ export function LineageList(props: PluginThreadListProps) {
           })(),
           dispatchedBy: peekThread.parentThreadId ? threadsById.get(peekThread.parentThreadId)?.displayTitle ?? null : null,
           children: threads.filter((t) => t.parentThreadId === peekThread.id).map((t) => toneOf(t.indicator)),
-          time: relativeTime(activityOf(peekThread, toneOf(peekThread.indicator) === "running"), Date.now()),
+          time: relativeTime(activityOf(peekThread, toneOf(peekThread.indicator) === "running"), Date.now(), lang),
         }
       : null;
 
@@ -585,8 +597,8 @@ export function LineageList(props: PluginThreadListProps) {
               <input
                 ref={inputRef}
                 value={text}
-                placeholder="筛选对话、分支、项目"
-                aria-label="筛选对话、分支、项目"
+                placeholder={tx.filterPlaceholder}
+                aria-label={tx.filterPlaceholder}
                 spellCheck={false}
                 onChange={(event) => {
                   setText(event.target.value);
@@ -613,26 +625,27 @@ export function LineageList(props: PluginThreadListProps) {
                   }
                 }}
               />
-              <button type="button" className="wl-kbd" title="清除筛选" onMouseDown={(event) => event.preventDefault()} onClick={closeSearch}>
+              <button type="button" className="wl-kbd" title={tx.clearFilter} onMouseDown={(event) => event.preventDefault()} onClick={closeSearch}>
                 esc
               </button>
             </label>
           ) : (
             <>
-              <div className="wl-seg" role="group" aria-label="排列方式" data-view={view}>
-                <button type="button" aria-pressed={view === "family"} title="一个 worktree 一张卡片；被派出的对话缩进排在派它的对话下面" onClick={() => switchView("family")}>
+              <div className="wl-seg" role="group" aria-label={tx.viewGroup} data-view={view}>
+                {/* 只有当前视图显示文字，另一个只留图标（名字在 aria-label / title 里）：英文叫法长，两个都写出来顶栏放不下 */}
+                <button type="button" aria-pressed={view === "family"} aria-label={tx.viewConversations} title={`${tx.viewConversations}: ${tx.viewConversationsHint}`} onClick={() => switchView("family")}>
                   <Glyph name="dispatch" size={12} />
-                  对话
+                  <span className="wl-seg-label">{tx.viewConversations}</span>
                 </button>
-                <button type="button" aria-pressed={view === "lineage"} title="按分支从哪切出来画成一棵树" onClick={() => switchView("lineage")}>
+                <button type="button" aria-pressed={view === "lineage"} aria-label={tx.viewTree} title={`${tx.viewTree}: ${tx.viewTreeHint}`} onClick={() => switchView("lineage")}>
                   <Glyph name="branch" size={12} />
-                  分支树
+                  <span className="wl-seg-label">{tx.viewTree}</span>
                 </button>
               </div>
               <span className="wl-grow" />
               {focusId ? (
                 <button type="button" className="wl-clear" onClick={() => setFocus(null)}>
-                  取消高亮
+                  {tx.clearHighlight}
                 </button>
               ) : null}
               {attentionIds.length > 0 && topAttentionColor ? (
@@ -640,22 +653,22 @@ export function LineageList(props: PluginThreadListProps) {
                   type="button"
                   className="wl-attn"
                   data-yours={topAttentionColor}
-                  aria-label={`跳到下一个需要我的对话（共 ${attentionIds.length} 条）`}
-                  title={`跳到下一个需要我的对话（共 ${attentionIds.length} 条；按 ] / [ 循环切换，在输入框里用 Alt/Option + ] / [）`}
+                  aria-label={tx.attentionLabel(attentionIds.length)}
+                  title={tx.attentionTitle(attentionIds.length)}
                   onClick={() => jumpAttention(1)}
                 >
                   <span className="wl-attn-dot" />
                   {attentionIds.length}
                 </button>
               ) : null}
-              <button type="button" className="wl-btn" aria-label="筛选" title="筛选对话、分支、项目（按 / ）" onClick={() => setSearching(true)}>
+              <button type="button" className="wl-btn" aria-label={tx.filter} title={tx.filterTitle} onClick={() => setSearching(true)}>
                 <Glyph name="search" />
               </button>
               <button
                 type="button"
                 className="wl-btn"
-                aria-label="重新读取 git"
-                title={query.isFetching ? "正在读取 git…" : "重新读取 git"}
+                aria-label={tx.rescan}
+                title={query.isFetching ? tx.rescanning : tx.rescan}
                 onClick={() => void query.refetch()}
               >
                 <Glyph name="refresh" className={query.isFetching ? "wl-spin" : undefined} />
@@ -666,7 +679,7 @@ export function LineageList(props: PluginThreadListProps) {
 
         {filtering ? (
           <>
-            <ResultGroup title="标题或分支" count={results.length}>
+            <ResultGroup title={tx.groupTitleOrBranch} count={results.length}>
               {results.map((thread) => (
                 <ThreadCell
                   key={thread.id}
@@ -680,7 +693,7 @@ export function LineageList(props: PluginThreadListProps) {
                 />
               ))}
             </ResultGroup>
-            <ResultGroup title="消息里提到" count={mentioned.length}>
+            <ResultGroup title={tx.groupMentioned} count={mentioned.length}>
               {mentioned.map((hit) => {
                 const live = threadsById.get(hit.id);
                 return live ? (
@@ -690,15 +703,15 @@ export function LineageList(props: PluginThreadListProps) {
                 );
               })}
             </ResultGroup>
-            <ResultGroup title="已归档" count={archivedHits.length}>
+            <ResultGroup title={tx.groupArchived} count={archivedHits.length}>
               {archivedHits.map((hit) => (
                 <HitCell key={hit.id} hit={hit} quiet />
               ))}
             </ResultGroup>
             {candidateIds.length === 0 ? (
-              <div className="wl-empty">{remoteBusy || (remote === null && text.trim().length >= 2) ? "正在搜索消息内容…" : "没有匹配的对话"}</div>
+              <div className="wl-empty">{remoteBusy || (remote === null && text.trim().length >= 2) ? tx.searchingMessages : tx.noMatches}</div>
             ) : remoteBusy ? (
-              <div className="wl-empty">正在搜索消息内容…</div>
+              <div className="wl-empty">{tx.searchingMessages}</div>
             ) : null}
           </>
         ) : null}
@@ -730,7 +743,8 @@ export function LineageList(props: PluginThreadListProps) {
 /** bb 官方搜索的一条命中：一条对话 + 命中的那段文字 */
 interface SearchHit {
   id: string;
-  title: string;
+  /** 没有标题时为 null，渲染时按语言显示“无标题” */
+  title: string | null;
   providerId: string | null;
   projectId: string | null;
   updatedAt: number;
@@ -753,7 +767,7 @@ function toHit(result: {
   const before = first && range ? flat(first.text.slice(Math.max(0, range.start - 14), range.start)) : "";
   return {
     id: thread.id,
-    title: thread.title ?? thread.titleFallback ?? "（无标题）",
+    title: thread.title ?? thread.titleFallback ?? null,
     providerId: thread.providerId,
     projectId: thread.projectId,
     updatedAt: thread.updatedAt,
@@ -794,6 +808,9 @@ function ResultGroup({ title, count, children }: { title: string; count: number;
 
 /** 不在侧边栏当前列表里的命中（主要是已归档的对话）：没有实时状态，只有标题、命中文字和时间 */
 function HitCell({ hit, quiet = false }: { hit: SearchHit; quiet?: boolean }) {
+  const tx = useT();
+  const lang = useLang();
+  const title = hit.title ?? tx.untitled;
   const list = useList();
   const navigate = useBbNavigate();
   const provider = hit.providerId ? list.providersById.get(hit.providerId) : undefined;
@@ -804,7 +821,7 @@ function HitCell({ hit, quiet = false }: { hit: SearchHit; quiet?: boolean }) {
           className="wl-cell-link"
           href="#"
           draggable={false}
-          aria-label={hit.title}
+          aria-label={title}
           onClick={(event) => {
             event.preventDefault();
             navigate.toThread(hit.id);
@@ -815,12 +832,12 @@ function HitCell({ hit, quiet = false }: { hit: SearchHit; quiet?: boolean }) {
           <span className="wl-logo" title={provider?.displayName}>
             {provider ? <ProviderIcon providerKind="agent" provider={provider} className="size-3.5" aria-label={provider.displayName} /> : null}
           </span>
-          <span className="wl-title">{hit.title}</span>
+          <span className="wl-title">{title}</span>
         </div>
         <div className="wl-line2">
           <Snippet hit={hit} />
           <span className="wl-grow" />
-          <span className="wl-time">{relativeTime(hit.updatedAt, list.now)}</span>
+          <span className="wl-time">{relativeTime(hit.updatedAt, list.now, lang)}</span>
         </div>
       </div>
     </li>
@@ -829,6 +846,7 @@ function HitCell({ hit, quiet = false }: { hit: SearchHit; quiet?: boolean }) {
 
 /** 置顶分区：第一条置顶出现时头部柔和淡入、最后一条归档时整区随行平滑收起 */
 function PinnedSection({ pinned }: { pinned: Thread[] }) {
+  const tx = useT();
   const list = useList();
   const presence = usePresenceList(pinned, (t) => t.id, {
     enabled: list.ready,
@@ -841,7 +859,7 @@ function PinnedSection({ pinned }: { pinned: Thread[] }) {
     <Section
       sectionKey="section:pinned"
       flipId={exitingAll ? undefined : "section:pinned"}
-      title="置顶"
+      title={tx.pinned}
       count={pinned.length || undefined}
       exiting={exitingAll}
       animateHeader={list.ready}
@@ -937,6 +955,7 @@ function ProjectSection({
   lineage: ProjectLineage | undefined;
   loading: boolean;
 }) {
+  const tx = useT();
   const list = useList();
   const navigate = useBbNavigate();
   const scan = lineage?.result.status === "ok" ? lineage.result.scan : null;
@@ -1001,7 +1020,7 @@ function ProjectSection({
     };
   }, [lineage, scan, navigate, projectId, list.onNavigate]);
 
-  const note = !scan && !isPersonal ? (loading ? "读取 git…" : lineage && lineage.result.status !== "not-git" ? "git 读取失败" : null) : null;
+  const note = !scan && !isPersonal ? (loading ? tx.readingGit : lineage && lineage.result.status !== "not-git" ? tx.gitFailed : null) : null;
 
   return (
     <Section
@@ -1014,8 +1033,8 @@ function ProjectSection({
         <button
           type="button"
           className="wl-btn wl-reveal"
-          aria-label={`在 ${name} 新建对话`}
-          title="新建对话"
+          aria-label={tx.newThreadIn(name)}
+          title={tx.newThread}
           onClick={() => {
             navigate.toCompose({ projectId: isPersonal ? undefined : projectId, focusPrompt: true });
             list.onNavigate();
@@ -1077,16 +1096,16 @@ function ProjectSection({
   );
 }
 
-function nodeTitle(view: ViewNode<Thread>): string {
+function nodeTitle(view: ViewNode<Thread>, tx: Messages): string {
   const { node } = view;
-  const name = (b: BranchView<Thread>) => b.branch ?? "分离 HEAD";
+  const name = (b: BranchView<Thread>) => b.branch ?? tx.detachedHead;
   const lines = [
     name(node),
-    node.worktreePath ? `worktree：${node.worktreePath}` : "没有 worktree（只是一个分叉点）",
-    view.via.length > 0 ? `来路：${[...view.via.map(name), name(node)].join(" → ")}` : null,
-    node.parentSource ? `起点依据：${SOURCE_LABEL[node.parentSource]}` : null,
-    node.ahead !== null && node.ahead > 0 ? `比起点多 ${node.ahead} 个提交` : null,
-    node.isExternal ? "在 bb 之外创建" : null,
+    node.worktreePath ? tx.nodeWorktree(node.worktreePath) : tx.nodeNoWorktree,
+    view.via.length > 0 ? tx.nodeVia([...view.via.map(name), name(node)].join(" → ")) : null,
+    node.parentSource ? tx.nodeSource(sourceLabel(tx, node.parentSource)) : null,
+    node.ahead !== null && node.ahead > 0 ? tx.nodeAhead(node.ahead) : null,
+    node.isExternal ? tx.nodeExternal : null,
   ];
   return lines.filter(Boolean).join("\n");
 }
@@ -1098,12 +1117,12 @@ function countThreads(view: ViewNode<Thread>): number {
 }
 
 /** 分支行右侧的小字标记：这条分支现在是什么状况 */
-function branchTags(node: BranchView<Thread>): string[] {
+function branchTags(node: BranchView<Thread>, tx: Messages): string[] {
   return [
-    node.isMain ? "主检出" : null,
-    node.merged ? "已合回" : node.ahead !== null && node.ahead > 0 ? `+${node.ahead}` : null,
-    node.worktreePath === null ? "无 worktree" : null,
-    node.isExternal ? "bb 之外" : null,
+    node.isMain ? tx.tagMain : null,
+    node.merged ? tx.tagMerged : node.ahead !== null && node.ahead > 0 ? `+${node.ahead}` : null,
+    node.worktreePath === null ? tx.tagNoWorktree : null,
+    node.isExternal ? tx.tagOutside : null,
   ].filter((tag): tag is string => tag !== null);
 }
 
@@ -1134,6 +1153,7 @@ function BranchItem({
   onEntered?: () => void;
   onExited?: () => void;
 }) {
+  const tx = useT();
   const list = useList();
   const { node } = view;
   const exiting = phase === "exiting";
@@ -1167,9 +1187,9 @@ function BranchItem({
     node.worktreePath && !node.isMain && !busy && !actions.canStartIn(node) && (quiet || node.merged || threads.length === 0)
       ? worktreeCleanupCommand({ repoPath: actions.repoPath, worktreePath: node.worktreePath, branch: node.branch, merged: node.merged })
       : null;
-  const labels = pathLabels(view.via, node);
+  const labels = pathLabels(view.via, node, tx.detachedHead);
   const leaf = labels.pop()!;
-  const tags = branchTags(node);
+  const tags = branchTags(node, tx);
 
   return (
     <MotionRow
@@ -1179,7 +1199,7 @@ function BranchItem({
       onExited={onExited}
       onSettled={list.syncPositions}
     >
-      <div className="wl-brow" title={nodeTitle(view)} data-dim={dim} data-quiet={quiet || node.merged || undefined} data-ghost={node.worktreePath === null || undefined}>
+      <div className="wl-brow" title={nodeTitle(view, tx)} data-dim={dim} data-quiet={quiet || node.merged || undefined} data-ghost={node.worktreePath === null || undefined}>
         <span className="wl-bicon" data-tone={tone ?? undefined}>
           <Glyph name={node.isMain ? "home" : node.branch === null ? "commit" : node.merged ? "merged" : "branch"} size={14} />
         </span>
@@ -1233,12 +1253,13 @@ function BranchItem({
 }
 
 function StartHereButton({ run, known, reveal = false }: { run: () => void; known: boolean; reveal?: boolean }) {
+  const tx = useT();
   return (
     <button
       type="button"
       className={reveal ? "wl-btn wl-reveal" : "wl-btn"}
-      aria-label="在这个 worktree 新建对话"
-      title={known ? "在这个 worktree 新建对话" : "新建对话（路径已复制，在环境里选 Existing worktree 粘贴）"}
+      aria-label={tx.startHere}
+      title={known ? tx.startHere : tx.startHereUnregistered}
       onClick={run}
     >
       <Glyph name="plus" size={12} />
@@ -1248,6 +1269,7 @@ function StartHereButton({ run, known, reveal = false }: { run: () => void; know
 
 /** 复制空闲 / 已合回 worktree 的安全清理命令（绝不自动删目录） */
 function CopyCleanupButton({ command }: { command: string }) {
+  const tx = useT();
   const [copied, setCopied] = useState(false);
   const timerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   useEffect(() => () => clearTimeout(timerRef.current), []);
@@ -1256,8 +1278,8 @@ function CopyCleanupButton({ command }: { command: string }) {
       type="button"
       className="wl-btn wl-reveal"
       data-copied={copied || undefined}
-      aria-label="复制安全清理命令"
-      title={copied ? `已复制：${command}` : `复制安全清理命令（不自动删除）：\n${command}`}
+      aria-label={tx.copyCleanup}
+      title={copied ? tx.copiedCleanup(command) : tx.copyCleanupTitle(command)}
       onClick={() => {
         void copyToClipboard({ text: command });
         setCopied(true);
@@ -1282,6 +1304,7 @@ function SettledFoot({
   open: boolean;
   holdsActive: boolean;
 }) {
+  const tx = useT();
   const list = useList();
   const key = `settled:${projectId}`;
   const presence = usePresenceList(items, (item) => item.thread.id, {
@@ -1296,7 +1319,7 @@ function SettledFoot({
     <div>
       <button type="button" className="wl-foot" data-open={open} aria-expanded={open} onClick={() => list.toggle(key, holdsActive)}>
         <Glyph name="chevron" size={9} className="wl-chev" />
-        <span>Settled {items.length}</span>
+        <span>{tx.footSettled(items.length)}</span>
       </button>
       <Collapse open={open}>
         <ul className="wl-tree">
@@ -1318,13 +1341,14 @@ function SettledFoot({
 
 /** 收起时常显并带上被收起的对话数；展开时只在悬停出现 */
 function FoldButton({ open, hidden, toggle }: { open: boolean; hidden: number; toggle: () => void }) {
+  const tx = useT();
   return (
     <button
       type="button"
       className={open ? "wl-chip wl-reveal" : "wl-chip"}
       data-open={open}
       aria-expanded={open}
-      title={open ? "收起从这里切出的分支" : `展开从这里切出的 ${hidden} 个对话`}
+      title={open ? tx.foldBranchesOpen : tx.foldBranchesClosed(hidden)}
       onClick={toggle}
     >
       {open ? null : hidden}
@@ -1335,6 +1359,7 @@ function FoldButton({ open, hidden, toggle }: { open: boolean; hidden: number; t
 
 /** 分支树视图的项目页脚：已合回的分支、没有对话的 worktree，各收成一个数字，点开才展开 */
 function ProjectFoot({ merged, idle, actions }: { merged: BranchView<Thread>[]; idle: BranchView<Thread>[]; actions: ProjectActions }) {
+  const tx = useT();
   const list = useList();
   const key = `foot:${actions.projectId}`;
   const mergedThreads = useMemo(() => merged.flatMap((branch) => [...walkThreads(branch.threads)]), [merged]);
@@ -1346,9 +1371,9 @@ function ProjectFoot({ merged, idle, actions }: { merged: BranchView<Thread>[]; 
     <div>
       <button type="button" className="wl-foot" data-open={open} aria-expanded={open} onClick={() => list.toggle(key, holdsActive)}>
         <Glyph name="chevron" size={9} className="wl-chev" />
-        {merged.length > 0 ? <span>已合回 {merged.length}</span> : null}
+        {merged.length > 0 ? <span>{tx.footMerged(merged.length)}</span> : null}
         {merged.length > 0 && idle.length > 0 ? <span className="wl-foot-sep">·</span> : null}
-        {idle.length > 0 ? <span>空闲 worktree {idle.length}</span> : null}
+        {idle.length > 0 ? <span>{tx.footIdle(idle.length)}</span> : null}
       </button>
       <Collapse open={open}>
         <ul className="wl-tree">
@@ -1503,6 +1528,7 @@ function QuickActions({
   startHere?: { run: () => void; known: boolean };
   settleAction?: { mode: "settle" | "unsettle"; run: () => void };
 }) {
+  const tx = useT();
   const target = actionTarget(thread);
   const entries = useThreadActions(target, { keys: QUICK_ACTIONS });
   return (
@@ -1512,8 +1538,8 @@ function QuickActions({
         <button
           type="button"
           className="wl-btn"
-          aria-label={settleAction.mode === "settle" ? "Settle" : "Unsettle"}
-          title={settleAction.mode === "settle" ? "Settle（收进 Settled，不归档不删环境）" : "Unsettle（移回主列表）"}
+          aria-label={settleAction.mode === "settle" ? tx.settle : tx.unsettle}
+          title={settleAction.mode === "settle" ? tx.settleTitle : tx.unsettleTitle}
           onClick={settleAction.run}
         >
           <Glyph name={settleAction.mode} size={13} />
@@ -1526,8 +1552,8 @@ function QuickActions({
             key={entry.key}
             type="button"
             className="wl-btn"
-            aria-label={entry.action.label}
-            title={entry.action.label}
+            aria-label={quickActionLabel(tx, entry.key, entry.action.label)}
+            title={quickActionLabel(tx, entry.key, entry.action.label)}
             disabled={entry.action.disabled}
             onClick={() => void entry.action.run()}
           >
@@ -1540,7 +1566,7 @@ function QuickActions({
         align="start"
         sideOffset={8}
         trigger={(triggerProps) => (
-          <button {...triggerProps} type="button" className="wl-btn" aria-label="更多操作" title="更多操作">
+          <button {...triggerProps} type="button" className="wl-btn" aria-label={tx.moreActions} title={tx.moreActions}>
             <Glyph name="more" size={14} />
           </button>
         )}
@@ -1592,6 +1618,8 @@ function ThreadCell({
   onEntered?: () => void;
   onExited?: () => void;
 }) {
+  const tx = useT();
+  const lang = useLang();
   const list = useList();
   const navigate = useBbNavigate();
   const { splitProps, layout } = useSidebarThreadSplit(thread.id);
@@ -1609,7 +1637,7 @@ function ThreadCell({
   const indicator = !hasUnsubmittedDraft ? thread.indicator : thread.indicator === "none" ? "draft" : thread.indicator === "runtime" ? "working-draft" : thread.indicator;
   const showGlyph = rowStatus !== null || indicator !== "none";
   const running = toneOf(thread.indicator) === "running";
-  const time = relativeTime(activityOf(thread, running), list.now);
+  const time = relativeTime(activityOf(thread, running), list.now, lang);
   const tone = rowTone(thread.indicator, hasUnsubmittedDraft);
   // 搜索结果行保留轻淡入；正常列表行由 MotionRow 高度撑开和全局 FLIP 接管，避免置顶滑移时闪烁
   const arrive = useRef(sub !== undefined && list.ready).current;
@@ -1691,8 +1719,8 @@ function ThreadCell({
                 type="button"
                 className="wl-btn"
                 style={{ width: 18, height: 18 }}
-                aria-label={`派自：${origin.displayTitle}`}
-                title={`派自：${origin.displayTitle}（点击打开）`}
+                aria-label={tx.dispatchedFrom(origin.displayTitle)}
+                title={tx.dispatchedFromOpen(origin.displayTitle)}
                 onClick={() => {
                   navigate.toThread(origin.id);
                   list.onNavigate();
@@ -1707,7 +1735,7 @@ function ThreadCell({
                 className="wl-chip"
                 data-open={fold.open}
                 aria-expanded={fold.open}
-                title={fold.open ? `收起它派出的 ${fold.count} 个对话` : `展开它派出的 ${fold.count} 个对话`}
+                title={fold.open ? tx.foldChildrenOpen(fold.count) : tx.foldChildrenClosed(fold.count)}
                 onClick={fold.toggle}
               >
                 <Glyph name="dispatch" size={9} />
@@ -1718,7 +1746,7 @@ function ThreadCell({
                 type="button"
                 className="wl-chip"
                 aria-pressed={isFocused}
-                title={isFocused ? "取消高亮" : `派出了 ${dispatched} 个对话，点击高亮它们`}
+                title={isFocused ? tx.clearHighlight : tx.highlightDispatched(dispatched)}
                 onClick={() => list.setFocus(isFocused ? null : thread.id)}
               >
                 <Glyph name="dispatch" size={9} />

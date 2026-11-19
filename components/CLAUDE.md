@@ -2,8 +2,9 @@
 > L2 | 父级: ../CLAUDE.md
 
 ## 成员清单
+i18n.tsx: 界面语言的 React 层。LanguageProvider 在列表根部解析一次语言（插件设置的实时值 > localStorage 镜像 > auto 时 BB 的 <html lang>、为空才看浏览器语言），把设置值镜像进 localStorage，并在挂载、语言变化、窗口获得焦点时经 reportLanguage 报给服务端；useT 取当前语言的词典（lineage-list 与 peek 里一律用 tx 取文案，tx 不和循环变量 t 撞名），readLanguageSync 给 app.tsx 注册时同步取语言
 lineage-list.tsx: experimental_threadList 槽位组件。两个视图，各有主角（默认“对话”，记住上次的选择）：
-  - 对话视图：ConversationItem。项目下面直接列对话，一条一行（provider 图标 + 标题 + 右侧两个固定槽：派出数量 / 状态或时间），不出现分支、worktree；被派出的对话缩进一格排在派它的对话下面，用细拐线连着，点派出数量整组收起（默认展开）；支持本地 Settle 软收起（悬停行尾 Settle / Unsettle 按钮；项目底部 SettledFoot「Settled N」架子，不触发 bb 归档也不删工作区，有新活动自动唤醒；项目计数只数主列表里的对话）；不显示空闲 worktree，不按“已合回”折叠
+  - 对话视图：ConversationItem。项目下面直接列对话，一条一行（provider 图标 + 标题 + 右侧两个固定槽：派出数量 / 状态或时间），不出现分支、worktree；被派出的对话缩进一格排在派它的对话下面，用细拐线连着，点派出数量整组收起（默认展开）；支持本地 Settle 软收起（悬停行尾 Settle / Unsettle 按钮，中文界面叫 搁置 / 取消搁置；项目底部 SettledFoot「Settled N」/「已搁置 N」架子，不触发 bb 归档也不删工作区，有新活动自动唤醒；项目计数只数主列表里的对话）；不显示空闲 worktree，不按“已合回”折叠
   - 分支树视图：BranchItem。分支是主行（图标 + 等宽分支名 + 右侧小字标记：主检出 / +领先提交数 / 已合回 / 无 worktree / bb 之外；悬停时标记原地换成“复制安全清理命令”“在此新建”和折叠按钮；清理命令只给 bb 之外（bb 没登记成环境）、没有对话在跑 / 等你 / 出错的空闲或已合回非主 worktree（bb 托管的 worktree 归 bb 管，绕过它删会留下悬空环境），形如 git -C <主检出> worktree remove <路径>，已合回再接 git branch -d，绝不带 --force / -D），它上面的对话是次级行（小一号、灰一档，按最近活动排；被派出的带一个“派自”小箭头，派出过对话的带“高亮它们”的数量槽），从它切出去的分支再缩进一格；项目页脚 ProjectFoot 收着“已合回 N · 空闲 worktree N”；没有 git 的项目照常列出对话、不画树
   - 顶栏待办徽标 .wl-attn：数出“需要你”的对话（黄 / 蓝 / 绿，Settled 里的不算），颜色取其中最需要你的一种；点击或按 ] / [（焦点不在输入框时）、Alt/Option + ] / [（任何地方，按 event.code）按屏幕上实际渲染的行序循环跳转（lib/settle 的 orderByVisual + nextAttentionId）
   共用的行 ThreadCell：全列表单行 28px（触屏 38px），只有搜索结果带第二行；对齐规则见 ../styles.css 的“树形列表”

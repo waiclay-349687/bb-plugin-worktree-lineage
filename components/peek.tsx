@@ -1,5 +1,5 @@
 /**
- * [INPUT]: 依赖 @get-bb/plugin-sdk/app 的线程数据类型、provider 图标、keyed RPC 查询与 useRpc; 读取本插件服务端的 briefing RPC（存盘的全程速览 + 是否落后 + 兜底摘要，一次取回）; 读取内置插件 bb--git 的 status 与 bb--github-pr-status 的 pullRequests
+ * [INPUT]: 依赖 @get-bb/plugin-sdk/app 的线程数据类型、provider 图标、keyed RPC 查询与 useRpc; 读取本插件服务端的 briefing RPC（存盘的全程速览 + 是否落后 + 兜底摘要，一次取回）; 读取内置插件 bb--git 的 status 与 bb--github-pr-status 的 pullRequests; 依赖 components/i18n 的 useT（卡片标签按界面语言）
  * [OUTPUT]: 对外提供 Peek: 悬停预览卡。有速览时显示“一句话 + 分阶段 + 现在 / 等你 / 下一步”；没有速览或速览落后时，用不花 token 的摘要（你问 / 答复）补上。卡片自己从不触发模型调用。在对话之间移动时是同一张卡片连续变形：位置和高度一起过渡，旧内容淡出的同时新内容淡入。鼠标可以移到卡片上：卡片不消失，文字可选中复制
  * [POS]: components 的浮层; 消费者: components/lineage-list.tsx; 与它的边界: 何时显示 / 隐藏由列表决定（鼠标进出卡片经 hover 回调告诉列表），这里只负责取数、展示与切换动画; 卡片渲染到 document.body（侧边栏有自己的层叠上下文，留在里面会被主区域盖住）
  * [PROTOCOL]: 变更时更新此头部,然后检查所在目录 CLAUDE.md
@@ -15,6 +15,8 @@ import {
 } from "@get-bb/plugin-sdk/app";
 import { z } from "zod";
 import { Glyph } from "@/components/icons";
+import { useT } from "@/components/i18n";
+import type { Messages } from "@/lib/i18n";
 import type { BriefingStage } from "@/lib/briefing";
 import type { BriefingView, serverContract } from "@/lib/contract";
 import { rowTone, type RowTone, type Tone } from "@/lib/view";
@@ -49,12 +51,13 @@ const prContract = defineRpcContract({
   },
 });
 
-const PR_STATE: Record<string, string> = { OPEN: "进行中", MERGED: "已合并", CLOSED: "已关闭", DRAFT: "草稿" };
+const prState = (tx: Messages, state: string): string =>
+  ({ OPEN: tx.prOpen, MERGED: tx.prMerged, CLOSED: tx.prClosed, DRAFT: tx.prDraft })[state.toUpperCase()] ?? state.toLowerCase();
 
-/** bb 自己管理的 worktree 路径又长又没有信息量，只说明它归 bb 管；其余路径把家目录缩成 ~ */
+/** bb 自己管理的 worktree 路径又长又没有信息量，不显示；其余路径把家目录缩成 ~ */
 function describePath(path: string | null): string | null {
   if (!path) return null;
-  if (path.includes("/.bb/plugins/environment-git-worktree/")) return "bb 管理的 worktree";
+  if (path.includes("/.bb/plugins/environment-git-worktree/")) return null;
   return formatHomePathForDisplay(path);
 }
 
@@ -82,24 +85,25 @@ export interface PeekTarget {
 const viewCache = new Map<string, BriefingView>();
 const EMPTY_VIEW: BriefingView = { briefing: null, freshness: null, recap: { turns: 0, ask: null, reply: null }, enabled: true };
 
-const STAGE_LABEL: Record<BriefingStage["state"], string> = { done: "已完成", doing: "进行中", dropped: "已放弃" };
-
 function StageMark({ state }: { state: BriefingStage["state"] }) {
+  const tx = useT();
+  const label = { done: tx.stageDone, doing: tx.stageDoing, dropped: tx.stageDropped }[state];
   return (
-    <span className="wl-peek-mark" data-state={state} role="img" aria-label={STAGE_LABEL[state]}>
+    <span className="wl-peek-mark" data-state={state} role="img" aria-label={label}>
       {state === "done" ? <Glyph name="check" size={10} /> : state === "dropped" ? <Glyph name="dash" size={10} /> : null}
     </span>
   );
 }
 
-const STATUS_LABEL: Record<RowTone, string> = { error: "出错", attention: "等你回复", draft: "有没发出去的草稿", running: "进行中", done: "已完成，未读" };
+const statusLabel = (tx: Messages, tone: RowTone): string =>
+  ({ error: tx.statusError, attention: tx.statusAttention, draft: tx.statusDraft, running: tx.statusRunning, done: tx.statusDone })[tone];
 
-const TONE_LABEL: [Tone | null, string][] = [
-  ["error", "出错"],
-  ["attention", "等你回复"],
-  ["running", "进行中"],
-  ["done", "完成未读"],
-  [null, "空闲"],
+/** 派出的对话按状态计数时的顺序与叫法（空闲的不值得占字） */
+const childLabels = (tx: Messages): [Tone, string][] => [
+  ["error", tx.childError],
+  ["attention", tx.childAttention],
+  ["running", tx.childRunning],
+  ["done", tx.childDone],
 ];
 
 /**
@@ -165,6 +169,7 @@ export function Peek({ target, hover }: { target: PeekTarget | null; hover: Peek
 const reducedMotion = () => typeof matchMedia === "function" && matchMedia("(prefers-reduced-motion: reduce)").matches;
 
 function PeekCard({ target, view, hover, closing }: { target: PeekTarget; view: BriefingView; hover: PeekHover; closing: boolean }) {
+  const tx = useT();
   const { thread } = target;
   const envId = thread.environment?.id ?? null;
   const keys = envId ? [envId] : [];
@@ -214,23 +219,23 @@ function PeekCard({ target, view, hover, closing }: { target: PeekTarget; view: 
   const changes = workspace?.allChanges ?? workspace?.workingTree;
   const uncommitted = workspace?.workingTree.fileCount ?? 0;
   const pullRequest = envId ? pr.data?.[envId]?.pullRequest : undefined;
-  const branch = target.branch ?? (target.detached ? "分离 HEAD" : null);
+  const branch = target.branch ?? (target.detached ? tx.detachedHead : null);
   const path = describePath(thread.environment?.path ?? null);
   const pluginId = typeof __BB_PLUGIN_ID__ === "string" ? __BB_PLUGIN_ID__ : "worktree-lineage";
 
   // 进展：一行里能说清的事实，逐项拼起来；空闲的不值得占字
   const progress: string[] = [];
-  if (recap.turns > 1) progress.push(`${recap.turns} 轮`);
+  if (recap.turns > 1) progress.push(tx.turns(recap.turns));
   if (target.children.length > 0) {
-    const busy = TONE_LABEL.filter(([tone]) => tone !== null)
+    const busy = childLabels(tx)
       .map(([tone, label]) => [target.children.filter((t) => t === tone).length, label] as const)
       .filter(([n]) => n > 0);
-    progress.push(`派出 ${target.children.length}${busy.length > 0 ? `（${busy.map(([n, label]) => `${n} ${label}`).join("、")}）` : ""}`);
+    progress.push(tx.dispatchedCount(target.children.length, busy.map(([n, label]) => tx.childPart(n, label))));
   }
-  if (pullRequest) progress.push(`PR #${pullRequest.number} ${PR_STATE[pullRequest.state.toUpperCase()] ?? pullRequest.state}`);
+  if (pullRequest) progress.push(tx.pullRequest(pullRequest.number, prState(tx, pullRequest.state)));
   const hasChanges = changes !== undefined && (changes.fileCount > 0 || uncommitted > 0);
   const tone = rowTone(thread.indicator, target.hasDraft);
-  const status = tone ? STATUS_LABEL[tone] : null;
+  const status = tone ? statusLabel(tx, tone) : null;
 
   return createPortal(
     <div
@@ -277,44 +282,44 @@ function PeekCard({ target, view, hover, closing }: { target: PeekTarget; view: 
         <dl className="wl-peek-recap">
           {fresh && briefing?.now ? (
             <>
-              <dt>现在</dt>
+              <dt>{tx.recapNow}</dt>
               <dd>{briefing.now}</dd>
             </>
           ) : null}
           {fresh && briefing?.waiting ? (
             <>
-              <dt data-tone="attention">等你</dt>
+              <dt data-tone="attention">{tx.recapWaiting}</dt>
               <dd>{briefing.waiting}</dd>
             </>
           ) : null}
           {fresh && briefing?.next ? (
             <>
-              <dt>下一步</dt>
+              <dt>{tx.recapNext}</dt>
               <dd data-quiet="true">{briefing.next}</dd>
             </>
           ) : null}
           {!fresh && recap.ask ? (
             <>
-              <dt>{briefing && newAsks > 0 ? "之后你问" : "你问"}</dt>
+              <dt>{briefing && newAsks > 0 ? tx.recapAskSince : tx.recapAsk}</dt>
               <dd data-quiet={briefing ? undefined : "true"}>{recap.ask}</dd>
             </>
           ) : null}
           {!fresh && recap.reply ? (
             <>
-              <dt>答复</dt>
+              <dt>{tx.recapReply}</dt>
               <dd>{recap.reply}</dd>
             </>
           ) : null}
           {progress.length > 0 || hasChanges ? (
             <>
-              <dt>进展</dt>
+              <dt>{tx.recapProgress}</dt>
               <dd data-quiet="true">
                 {progress.join(" · ")}
                 {hasChanges && changes ? (
                   <>
                     {progress.length > 0 ? " · " : null}
                     <b data-kind="add">+{changes.insertions}</b> <b data-kind="del">−{changes.deletions}</b>
-                    {uncommitted > 0 ? ` · ${uncommitted} 个未提交` : null}
+                    {uncommitted > 0 ? ` · ${tx.uncommitted(uncommitted)}` : null}
                   </>
                 ) : null}
               </dd>
@@ -322,7 +327,7 @@ function PeekCard({ target, view, hover, closing }: { target: PeekTarget; view: 
           ) : null}
         </dl>
         {briefing && !fresh ? (
-          <p className="wl-peek-behind">{newAsks > 0 ? `上面的阶段写于 ${newAsks} 轮之前` : "上面的阶段写于最新答复之前"}，这一轮结束后更新</p>
+          <p className="wl-peek-behind">{newAsks > 0 ? tx.behindByAsks(newAsks) : tx.behindLatestReply}</p>
         ) : null}
 
         {branch || target.dispatchedBy ? (
@@ -332,11 +337,11 @@ function PeekCard({ target, view, hover, closing }: { target: PeekTarget; view: 
                 <Glyph name="branch" size={11} />
                 <span className="wl-peek-mono">
                   {branch}
-                  {target.parentBranch ? <em> from {target.parentBranch}</em> : null}
+                  {target.parentBranch ? <em>{tx.branchFrom(target.parentBranch)}</em> : null}
                 </span>
               </div>
             ) : null}
-            {path && path !== "bb 管理的 worktree" ? (
+            {path ? (
               <div className="wl-peek-row">
                 <Glyph name="home" size={11} />
                 <span className="wl-peek-mono">{path}</span>
@@ -345,7 +350,7 @@ function PeekCard({ target, view, hover, closing }: { target: PeekTarget; view: 
             {target.dispatchedBy ? (
               <div className="wl-peek-row">
                 <Glyph name="origin" size={11} />
-                <span>派自：{target.dispatchedBy}</span>
+                <span>{tx.dispatchedFrom(target.dispatchedBy)}</span>
               </div>
             ) : null}
           </div>

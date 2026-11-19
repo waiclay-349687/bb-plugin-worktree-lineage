@@ -7,8 +7,8 @@
     "bbPluginSdk": ">=0.6.132"
   },
   "bb": {
-    "name": "Worktree 血缘",
-    "description": "按“代码从哪来”排列的侧边栏：分支树为主干，对话挂在所在 worktree 下，标注谁派的、是否已合回。",
+    "name": "Worktree Lineage",
+    "description": "A sidebar thread list laid out by where the code came from: Conversation and Branch Tree views, hover briefings, Settle and attention jumps.",
     "branding": {
       "icon": "GitBranch"
     },

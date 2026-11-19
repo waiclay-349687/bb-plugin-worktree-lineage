@@ -107,28 +107,14 @@
   background: linear-gradient(var(--sidebar), transparent);
   pointer-events: none;
 }
+/* 两个按钮宽度不等：当前视图带文字，另一个只留图标（英文叫法长，两个都写出来顶栏放不下）；底色直接落在当前按钮上 */
 .wl-seg {
   position: relative;
-  display: inline-grid;
-  grid-template-columns: 1fr 1fr;
+  display: inline-flex;
+  flex: none;
   padding: 2px;
   border-radius: var(--wl-r-md);
   background: color-mix(in oklab, var(--ink) 7%, transparent);
-}
-/* 滑块：切换排列时从一边滑到另一边 */
-.wl-seg::before {
-  content: "";
-  position: absolute;
-  top: 2px;
-  bottom: 2px;
-  left: 2px;
-  width: calc(50% - 2px);
-  border-radius: var(--wl-r-sm);
-  background: color-mix(in oklab, var(--ink) 12%, transparent);
-  transition: transform 0.22s cubic-bezier(0.3, 0.7, 0.2, 1);
-}
-.wl-seg[data-view="lineage"]::before {
-  transform: translateX(100%);
 }
 .wl-seg button {
   position: relative;
@@ -137,16 +123,23 @@
   justify-content: center;
   gap: 5px;
   height: 22px;
-  padding: 0 9px;
+  padding: 0 8px;
   border-radius: var(--wl-r-sm);
   font-size: var(--text-2xs, 0.6875rem);
   font-weight: 500;
+  white-space: nowrap;
   color: var(--subtle-foreground);
-  transition: color 0.15s ease;
+  transition: color 0.15s ease, background-color 0.18s ease;
 }
 .wl-seg button:hover,
 .wl-seg button[aria-pressed="true"] {
   color: var(--sidebar-foreground);
+}
+.wl-seg button[aria-pressed="true"] {
+  background: color-mix(in oklab, var(--ink) 12%, transparent);
+}
+.wl-seg button[aria-pressed="false"] .wl-seg-label {
+  display: none;
 }
 .wl-root[data-compact="true"] .wl-seg button {
   height: 30px;

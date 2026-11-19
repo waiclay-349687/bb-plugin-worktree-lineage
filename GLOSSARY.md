@@ -2,6 +2,8 @@
 
 bb 侧边栏的对话列表：同一批对话的两种排列，一种以对话为主角，一种以分支为主角。
 
+界面有英文与简体中文两套叫法，选了一种就只出现这一种（专有名词与代码除外）。下面每个词后面括号里是英文界面的叫法；两套文案都在 lib/i18n.ts，改叫法先改这里、再改词典。
+
 ## Language
 
 ### 两种视图
@@ -45,9 +47,13 @@ _Avoid_: needs you、attention
 对话做完了，用户还没看。整行绿色。
 _Avoid_: done-unread
 
-**Settled**:
-用户手动收起的、做完了暂时不用看的对话，排在项目底部的「Settled N」架子里；动作叫 Settle，移回叫 Unsettle。只是本机的显示状态，不是 bb 的归档，不删 worktree 与环境；对话重新运行、有草稿、等你或有新活动就自动回到主列表。
-_Avoid_: 已完结、完结、归档、archive
+**搁置**（Settle / Settled）:
+用户手动收起的、做完了暂时不用看的对话，排在项目底部的「已搁置 N」（英文界面 Settled N）架子里；动作叫搁置（Settle），移回叫取消搁置（Unsettle）。只是本机的显示状态，不是 bb 的归档，不删工作树与环境；对话重新运行、有草稿、等你或有新活动就自动回到主列表。
+_Avoid_: 已完结、完结、归档、archive；中文界面里不出现 Settle / Settled
+
+**工作树**（worktree）:
+git worktree 在中文界面里的叫法：空闲工作树（Idle worktrees）、无工作树（No worktree）、外部工作树（Outside BB，bb 之外建的）。
+_Avoid_: 中文界面里写 worktree、bb 之外
 
 **速览**:
 一条对话按阶段归并出的全程进展，由模型在每轮结束后写好存盘。

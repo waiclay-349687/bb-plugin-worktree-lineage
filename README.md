@@ -1,66 +1,189 @@
-# Worktree 血缘（bb 插件）
+# Worktree Lineage
 
-替换 bb 侧边栏的线程列表：按“代码从哪来”排列。
+> **English** | [简体中文](README.zh-CN.md)
 
-顶上有两个视图，各有主角：
+**A replacement thread list for the [bb](https://getbb.app) sidebar: see where every conversation stands, and which branch its code came from.**
 
-**对话（默认）**
-- 只讲对话：项目下面直接列对话，一条一行（provider 图标、标题、右侧的派出数量和状态或时间），按最近的真实活动排序（只是点开看一眼不算）。
-- 不出现分支和 worktree。想知道一条对话在哪个分支，看悬停卡片，或切到分支树。
-- 被派出的对话缩进一格排在派它的对话下面，用一条细拐线连着；点派出数量可以整组收起。
+<table>
+  <tr>
+    <td width="70%"><img src="docs/screenshots/conversation-view.png" alt="Conversation view with row colors, the Settled shelf and a hover briefing card"></td>
+    <td width="30%"><img src="docs/screenshots/branch-tree-view.png" alt="Branch Tree view with nested branches and the copy-cleanup-command button"></td>
+  </tr>
+  <tr>
+    <td align="center"><sub>Conversation view · row colors · Settled shelf · hover briefing</sub></td>
+    <td align="center"><sub>Branch Tree view · copy a safe cleanup command</sub></td>
+  </tr>
+</table>
 
-**分支树**
-- 分支是主行：分支图标、等宽的分支名，右侧小字标明“主检出、领先几个提交、已合回、无 worktree”。从它切出去的分支缩进一格。
-- 对话是挂在分支下面的次级行，小一号、灰一档。
-- 没有对话的 worktree 和已合回的分支收在项目末尾的“已合回 N · 空闲 worktree N”里。没有 git 的项目照常列出对话。
+<sub>Screenshots use demo data. The interface is available in English and Simplified Chinese, never mixed (see <a href="#configuration">Configuration</a>).</sub>
 
-对齐只有一条规则：下一级的图标对齐上一级文字的左缘。右侧的时间、数量、分支标记都贴同一条右边线。
+## Views
 
-**两个视图共用**
-- 运行中的对话：行的外缘有一圈很细的流光描边（做法参考 Hermes desktop）。
-- 悬停时行尾原地换成快捷操作：重新生成标题、归档、更多；右键是 bb 的完整线程菜单。
-- 颜色即含义，整行的底色有三种：黄 = 输入框里有没发出去的草稿（行尾带铅笔）；蓝 = 它停下来等你，包括等你回复和出错（行尾的标记区分这两种）；绿 = 做完了，你还没看。同时有几种时按“出错 > 等你回复 > 草稿 > 完成未读”取一种；运行中是流光描边，不占底色。
-- 悬停预览卡：鼠标在一条对话上停约半秒，旁边浮出一张“全程速览”——一句话说明这条对话在做什么、按时间归并出的几个阶段（已完成 / 进行中 / 已放弃，各带一句结论）、现在停在哪、等你做什么决定、下一步，以及进展（轮数、派出的对话、PR、改动行数）。在对话之间移动时是同一张卡片连续变形：位置和高度一起过渡，旧内容淡出的同时新内容淡入；经过分组标题、空隙时卡片留在原地等你落到下一条对话上；别处的滚动（比如正在输出的聊天区）不会把它关掉。鼠标可以移到卡片上：卡片不消失，里面的文字能选中、能复制；Esc 或移开鼠标收起。
-  - 速览由小模型在后台写，按顺序试本机 Magpie 网关（默认 `http://127.0.0.1:3425`）上的模型链，默认 `workbuddy/deepseek-v4.1-flash` → `opencode-zen/deepseek-v4.1-flash-free`（免费但额度少）；某个模型超时、出错或写得不合格就试下一个，都不行再兜底到本机的 Claude（默认 haiku）。模型链在设置里用逗号分隔填写，付费直连的模型不在默认链里：每轮对话结束后，把整条对话每一轮的要求和答复开头（bb 的对话大纲，几千字）交给它，结果存盘。悬停只读存盘的结果，从不触发模型调用。
-  - 网关调用是一次纯 HTTP 请求（45s 超时，不启动进程），实测 2–6 秒；注意对话提要会发给网关背后的模型服务商。返回 429 的模型按 `Retry-After` 冷却（缺省 15 分钟、最多 25 分钟），网关连不上整体冷却 1 分钟，冷却期内直接跳过、不刷日志。网关地址留空即只用 Claude。
-  - 回退时是一次性的 `claude -p`：不加载用户的设置与钩子、不保存会话、不带任何工具。走 Claude 订阅额度，实测每条 $0.0002–0.002。
-  - 速览还没写出来、或写完之后又有了新要求时，卡片用不花额度的摘要补上（你问 / 答复，取自对话大纲）。
-  - 开关与模型：`bb plugin config worktree-lineage set briefingEnabled false`、`bb plugin config worktree-lineage set briefingModel <名字>`。保护：一次只写一条、每天最多 300 次、连续失败 3 次就停。
-- Settle（软收起）：对话视图悬停行尾可点 Settle，把已做完但暂时不想触发 bb 归档（不删托管 worktree 与环境）的对话收进项目底部的「Settled N」架子；只要该对话重新运行、出现草稿、等你回复或有新活动，会自动唤醒回主列表，也可随时点 Unsettle 移回。Settle 只记在本机浏览器的本地存储里。
-- 待办快跳：有黄 / 蓝 / 绿底色对话时，顶栏显示待办数量徽标，点击，或按 `]` / `[`（焦点在输入框里时不触发；打开对话后 bb 会把焦点放进输入框，这时用 `Alt/Option + ]` / `[`，任何地方都能用）按侧边栏里的显示顺序循环跳转到下一条 / 上一条需要你处理的对话。
-- 快速筛选：按 `/`（或点放大镜）输入，候选分三组——标题或分支、消息里提到、已归档；后两组来自 bb 官方搜索。方向键选择，回车打开，Esc 退出。
-- 项目底部：没有对话的 worktree（含 Claude Code、ORCA、手动建的）和已合回分支收成页脚数字，展开后可直接在里面开新对话，或一键复制安全的 `git -C <主检出> worktree remove <路径>`（已合回附带 `git branch -d`）清理命令；只对 bb 之外的 worktree 提供（bb 托管的 worktree 由 bb 归档时自己清理），里面还有对话在跑或等你时不提供，命令绝不带 `--force` / `-D`（插件本身只读 git，绝不自动删目录）。
-- 颜色全部取自 bb 主题变量，浅色、深色和自定义配色都跟随；整个侧边栏光标保持箭头；触屏下操作按钮常显且点击区域加大。
+Two views of the same threads, switched from the top of the list. Each one has a single main subject.
 
-## 分支起点怎么来的
+**Conversation (default)**
+- One row per thread: provider icon, title, and on the right a dispatched-thread count plus status or time.
+- Threads a thread dispatched are indented under it with thin connector lines. Click the count to fold the whole group.
+- Sorted by real activity. Just opening a thread to look at it does not move it.
+- No branches or worktrees here. To see a thread's branch, hover it or switch views.
 
-只用记录，不按提交历史推算，可信度从高到低：
+**Branch Tree**
+- Branches are the main rows, nested by the branch each one was cut from. Small tags on the right show main checkout, commits ahead (`+12`), merged, no worktree, or outside bb.
+- Threads hang under their branch as smaller secondary rows.
+- Worktrees with no threads and merged branches fold into a footer at the end of each project.
+- Projects without git still list their threads.
 
-1. bb 建 worktree 时记录的起点（环境的选择器输入 / mergeBaseBranch）
-2. git 分支创建记录 `branch: Created from <分支>`
-3. 创建记录只有提交号时，反查当时哪个分支指向它；`Created from HEAD` 时查 HEAD 的 checkout 记录
-4. 都查不到：标“来源未知”
+One alignment rule throughout: a child's icon lines up with its parent's text, and all times, counts and tags share one right edge.
 
-## 开发
+## Highlights
+
+- **Color means something.** Each row has at most one background color:
+  - Yellow: unsent text in the composer.
+  - Blue: it stopped and is waiting for you (a question or an error; the trailing mark tells them apart).
+  - Green: finished and you haven't looked yet.
+
+  Priority is error › waiting for reply › draft › finished-unread. A running thread gets a thin flowing border instead of a color.
+- **Hover actions in place:** regenerate title, archive, and more. Right-click opens bb's full thread menu.
+- **Quick filter:** press `/` and type. Results come in three groups: title or branch, mentioned in messages, and archived; the last two come from bb's own search.
+- **Follows any theme.** Colors come only from bb theme variables. On touch screens, action buttons are always visible and bigger.
+
+## Hover Briefings
+
+Rest the pointer on a thread for about half a second and a briefing card appears next to it:
+- What the thread is about, in one sentence.
+- The stages it went through (done / in progress / dropped, each with a one-line outcome).
+- Where it stands now, what it is waiting on you for, and the likely next step.
+- Progress: turns, dispatched threads, pull request, lines changed.
+
+Moving between rows morphs one card instead of flashing new ones. You can move onto the card to select and copy text, and `Esc` closes it.
+
+Briefings are written in the background by a small model and saved:
+- **When:** only after a turn ends, plus a one-time catch-up at startup for threads active in the last 14 days (at most 40). Hovering only reads the saved result and never calls a model.
+- **Free fallback:** until a briefing exists, or once it falls behind, the card shows a zero-cost recap built from bb's conversation outline (your last request and the reply).
+- **Guard rails:** one briefing at a time, at most 300 a day, and the queue stops after 3 failures in a row.
+
+**Which model writes them.** The plugin first tries an OpenAI-compatible gateway on your own machine (by default a local Magpie gateway at `http://127.0.0.1:3425`), then falls back to your local Claude Code CLI:
+
+1. `workbuddy/deepseek-v4.1-flash` on the gateway
+2. `opencode-zen/deepseek-v4.1-flash-free` on the gateway (free, with a small quota)
+3. `claude -p --model haiku` on your machine
+
+**No gateway installed? Nothing to set up.** If nothing listens on that address, the request fails instantly and the plugin uses your local `claude` CLI, retrying the gateway at most once a minute. To skip the gateway entirely, clear `briefingGatewayUrl` (see [Configuration](#configuration)).
+
+> [!NOTE]
+> When a gateway is used, the conversation digest (each request plus the start of each reply) is sent to whichever model provider sits behind that gateway. Paid direct APIs are deliberately left out of the default chain.
+
+<details>
+<summary>Routing details</summary>
+
+- Each gateway call is one plain HTTP request to `/v1/chat/completions` with a 45 s timeout. No process is started. Measured at 2–6 s per briefing.
+- A model that times out, returns an error, or writes output that fails validation is skipped and the next one is tried.
+- `429` responses put that model on cooldown for its `Retry-After` value (15 minutes if missing, capped at 25 minutes). An unreachable gateway cools down as a whole for 60 s. Models on cooldown are skipped silently; the cooldown table lives in memory and clears on reload.
+- The Claude fallback is a one-shot `claude -p --effort low` that loads no user settings or hooks (`--setting-sources ""`, `disableAllHooks`), saves no session (`--no-session-persistence`), and gets no tools (`--tools ""`, `--strict-mcp-config`), run from an empty temp directory. It uses your Claude subscription; measured at $0.0002–0.002 per briefing.
+- The plugin log records which route and model wrote each briefing (`via gateway …` or `via claude … (fallback)`), and each model that failed or was skipped.
+
+</details>
+
+## Shortcuts & Settle
+
+| Action | How |
+|---|---|
+| Filter threads, branches, projects | `/`, then arrow keys and `Enter`; `Esc` to leave |
+| Next / previous thread that needs you | `]` / `[` when focus is not in a text field |
+| Same, from anywhere (including the composer) | `Alt/Option + ]` / `[` |
+| Jump to the next thread that needs you | Click the count badge at the top of the list |
+
+bb moves focus into the composer when a thread opens, so after the first jump use the `Alt/Option` form. "Needs you" means a yellow, blue or green row. Jumps follow the order you see on screen.
+
+**Settle** parks a finished thread without archiving it:
+- Hover a top-level row in the Conversation view and click **Settle**. The thread, with any threads it dispatched, moves into the project's **Settled N** shelf. **Unsettle** moves it back.
+- It wakes up by itself as soon as it runs again, gets a draft, waits for you, or shows new activity.
+- Settle is stored only in this browser's local storage. It never archives the thread and never touches its worktree or environment. Pinned threads can't be settled.
+
+## Branch Lineage
+
+A branch's origin comes only from records, never from guessing with commit history. In order of trust:
+
+1. The base bb recorded when it created the worktree.
+2. git's branch-creation reflog entry `branch: Created from <branch>`.
+3. If that entry only has a commit, the branch that pointed at it at the time (for `Created from HEAD`, HEAD's checkout record).
+4. Nothing found: shown as unknown.
+
+**Safe cleanup.** In the Branch Tree footer, an idle or merged worktree that bb doesn't manage gets a button that copies a cleanup command:
 
 ```sh
-npm install
-npx tsc --noEmit -p tsconfig.json
-npx vitest run
-bb plugin build .
-bb plugin install "path:$PWD" --yes      # 首次
-bb plugin reload worktree-lineage        # 之后
-bb settings ui set sidebar.threadListProvider worktree-lineage/lineage   # 启用
-bb settings ui reset sidebar.threadListProvider                          # 回退到 bb 自带列表
+git -C <main checkout> worktree remove <path>            # idle worktree
+git -C <main checkout> worktree remove <path> && git -C <main checkout> branch -d <branch>   # merged
 ```
 
-插件只读 git，从不修改仓库或删除 worktree。除了写速览时调用模型网关或本机的 claude，不联网。
+<details>
+<summary>What the cleanup button will and won't do</summary>
 
-## 同系列 BB 插件
+- It only copies text. The plugin itself only reads git and never deletes a directory or branch.
+- The command never contains `--force` or `-D`, so git refuses if the worktree has uncommitted changes or the branch has unmerged commits.
+- It is not offered for the main checkout, for worktrees bb created (bb removes those itself when you archive the thread; deleting them behind bb's back would leave stale environments), or while any thread in that worktree is running, waiting, or in error.
 
-- [bb-plugin-worktree-lineage](https://github.com/waiclay-349687/bb-plugin-worktree-lineage)（本插件）：左侧线程列表，按对话 / 分支树双视图展示，带 Settle 软收起、待办快跳、悬停全程速览与丝滑动效
-- [bb-plugin-session-cockpit](https://github.com/waiclay-349687/bb-plugin-session-cockpit)：右上角会话驾驶舱，按 Progress / Usage / Workspace 分组展示阶段进度、上下文明细、缓存与本地服务（与本插件共享速览数据）
-- [bb-plugin-usage-rings](https://github.com/waiclay-349687/bb-plugin-usage-rings)：左下角侧边栏额度圆环，统一展示各家 Agent 计划用量与配速（含 Antigravity）
+</details>
+
+## Configuration
+
+| Setting | Default | What it does |
+|---|---|---|
+| `language` | `auto` | Interface and briefing language: `auto`, `en` or `zh`. `auto` follows BB's own interface language, so an English BB gets an English list. Pick `zh` to use Chinese in an English BB. |
+| `briefingEnabled` | `true` | Write hover briefings with a small model. Off: cards show only the zero-cost recap. |
+| `briefingGatewayUrl` | `http://127.0.0.1:3425` | OpenAI-compatible gateway tried first. Leave empty to use only the local Claude CLI. |
+| `briefingGatewayModel` | `workbuddy/deepseek-v4.1-flash, opencode-zen/deepseek-v4.1-flash-free` | Comma-separated models on that gateway, tried in order. A single name works too. |
+| `briefingModel` | `haiku` | Model passed to `claude --model` when every gateway model fails. |
+
+Change them in bb's plugin settings, or from the CLI. Changing `language` takes effect immediately:
+- Whichever language you pick, the whole interface uses only that language. That covers buttons, tags, times (`5m` / `5分钟`), tooltips and the hover card. In Chinese, Settle becomes 搁置 and Settled becomes 已搁置.
+- Briefings are rewritten in the new language. Until then, a card shows only the recap, never text in the other language.
+- The settings page itself is rendered by bb and stays in English.
+
+```sh
+bb plugin config worktree-lineage                                   # show current values
+bb plugin config worktree-lineage set language zh                   # en | zh | auto
+bb plugin config worktree-lineage set briefingEnabled false
+bb plugin config worktree-lineage set briefingGatewayModel "my-provider/my-model"
+bb plugin config worktree-lineage set briefingModel sonnet
+bb plugin config worktree-lineage unset briefingGatewayModel        # back to the default
+```
+
+## Install
+
+Requires bb 0.49 or later. Hover briefings use the `claude` CLI if it is installed.
+
+```sh
+git clone https://github.com/waiclay-349687/bb-plugin-worktree-lineage.git
+cd bb-plugin-worktree-lineage
+npm install --include=dev
+bb plugin build .
+bb plugin install "path:$PWD" --yes
+bb settings ui set sidebar.threadListProvider worktree-lineage/lineage
+```
+
+To go back to bb's built-in thread list:
+
+```sh
+bb settings ui reset sidebar.threadListProvider
+```
+
+## Develop
+
+```sh
+npx tsc --noEmit -p tsconfig.json    # typecheck
+npx vitest run                       # tests
+bb plugin build .                    # build
+bb plugin reload worktree-lineage    # reload after a change
+```
+
+The plugin only reads git and never modifies a repository. Apart from writing briefings through your gateway or local `claude`, it makes no network calls. The plugin is built on bb's `experimental_*` SDK APIs, so check it again after bb upgrades.
+
+## Related BB Plugins
+
+- [bb-plugin-worktree-lineage](https://github.com/waiclay-349687/bb-plugin-worktree-lineage) (this plugin) — Sidebar thread list with Conversation and Branch Tree views, Settle, attention jumps, hover briefings and smooth motion.
+- [bb-plugin-session-cockpit](https://github.com/waiclay-349687/bb-plugin-session-cockpit) — Top-right thread cockpit with Progress, Usage & live Context breakdown, real-time Context files tracking, Servers, Scripts, and Connectors.
+- [bb-plugin-usage-rings](https://github.com/waiclay-349687/bb-plugin-usage-rings) — Bottom-left sidebar usage rings with pace tracking across providers including Antigravity.
 
 ## License
 

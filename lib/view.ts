@@ -1,6 +1,6 @@
 /**
  * [INPUT]: 依赖 lib/tree 的 BranchView / LineageTree / collectFolded / branchLabel
- * [OUTPUT]: 对外提供 buildProjectView（血缘树 → 卡片/分叉点视图模型）、pathLabels、toneOf / rollupTone / rowTone / rowColor（状态色调）
+ * [OUTPUT]: 对外提供 buildProjectView（血缘树 → 卡片/分叉点视图模型）、pathLabels（分离 HEAD 的文案由调用方按语言给）、toneOf / rollupTone / rowTone / rowColor（状态色调）、relativeTime（转出 lib/i18n 的按语言相对时间）、worktreeCleanupCommand
  * [POS]: lib 的展示模型层，纯函数; 消费者: components/lineage-list.tsx; 与 lib/tree.ts 的边界: tree 决定“谁挂在谁下面”，本文件决定“画成什么”（卡片 / 分叉点标签 / 并入路径 / 收进页脚）
  * [PROTOCOL]: 变更时更新此头部,然后检查所在目录 CLAUDE.md
  */
@@ -63,11 +63,11 @@ export function buildProjectView<T extends ThreadLike>(tree: LineageTree<T>): Pr
   };
 }
 
-/** 路径上每一段的显示名（去掉 thr 后缀与前缀），相邻重名只留一个：bb/c1-thr_x › mobile/c1 → ["c1"] */
-export function pathLabels(via: readonly BranchView[], node: BranchView): string[] {
+/** 路径上每一段的显示名（去掉 thr 后缀与前缀），相邻重名只留一个：bb/c1-thr_x › mobile/c1 → ["c1"]；分离 HEAD 用调用方给的当前语言文案 */
+export function pathLabels(via: readonly BranchView[], node: BranchView, detachedLabel: string): string[] {
   const names: string[] = [];
   for (const step of [...via, node]) {
-    const name = step.branch === null ? "分离 HEAD" : branchLabel(step.branch).leaf;
+    const name = step.branch === null ? detachedLabel : branchLabel(step.branch).leaf;
     if (names[names.length - 1] !== name) names.push(name);
   }
   return names;
@@ -140,16 +140,8 @@ export function countViewThreads(nodes: readonly ViewNode[]): number {
   return total;
 }
 
-/** 相对时间，尽量短：刚刚 / 5m / 3h / 2d / 3w */
-export function relativeTime(at: number, now: number): string {
-  const minutes = Math.floor(Math.max(0, now - at) / 60_000);
-  if (minutes < 1) return "刚刚";
-  if (minutes < 60) return `${minutes}m`;
-  const hours = Math.floor(minutes / 60);
-  if (hours < 24) return `${hours}h`;
-  const days = Math.floor(hours / 24);
-  return days < 14 ? `${days}d` : `${Math.floor(days / 7)}w`;
-}
+/** 相对时间按界面语言写，实现在 lib/i18n（这里转出，调用方不必关心文案在哪） */
+export { relativeTime } from "./i18n";
 
 /** POSIX 单引号安全转义：仅在包含空格或特殊字符时加引号 */
 function shellArg(value: string): string {

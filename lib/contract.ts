@@ -1,6 +1,6 @@
 /**
  * [INPUT]: 依赖 @get-bb/plugin-sdk 的 defineRpcContract 与 zod
- * [OUTPUT]: 对外提供 hostContract（host 端契约: scanLineage 读 git、writeBriefing 按 route 调网关或本机 claude，失败可带冷却建议）、modelRouteSchema / ModelRoute（gateway | claude 两条通道）、serverContract（app↔server 契约: lineage、briefing）及血缘数据类型
+ * [OUTPUT]: 对外提供 hostContract（host 端契约: scanLineage 读 git、writeBriefing 按 route 调网关或本机 claude，失败可带冷却建议）、modelRouteSchema / ModelRoute（gateway | claude 两条通道）、serverContract（app↔server 契约: lineage、briefing、reportLanguage）及血缘数据类型
  * [POS]: lib 的契约层; 消费者: host.ts、server.ts、briefings.ts、lib/model-run.ts、app.tsx、components/peek.tsx、lib/lineage.ts; 只定义数据形状，不含逻辑; serverContract.briefing 的输出另被 session-cockpit 插件跨插件读取，字段不可随意改
  * [PROTOCOL]: 变更时更新此头部,然后检查所在目录 CLAUDE.md
  */
@@ -160,5 +160,10 @@ export const serverContract = defineRpcContract({
   briefing: {
     input: z.object({ threadId: z.string().min(1) }),
     output: briefingViewSchema,
+  },
+  /** 前端报告它解析出的界面语言（设置为 auto 时由浏览器语言决定）；服务端据此决定 auto 模式下速览用哪种语言 */
+  reportLanguage: {
+    input: z.object({ language: z.enum(["en", "zh"]) }),
+    output: z.object({ ok: z.literal(true) }),
   },
 });

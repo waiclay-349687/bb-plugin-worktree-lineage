@@ -1,14 +1,15 @@
 /**
- * [INPUT]: 依赖 zod; 依赖 lib/search 的 plainSnippet（把大纲预览压成纯文字）
- * [OUTPUT]: 对外提供 toTurns / countAsks（把 bb 的对话大纲切成“一轮要求 + 结论”）、outlineKey / freshness（存盘的速览是否落后于当前大纲）、buildDigest（喂给模型的全程提要）、BRIEFING_SYSTEM_PROMPT、parseBriefing（校验模型输出）、briefingSchema 与 Briefing 类型
+ * [INPUT]: 依赖 zod; 依赖 lib/search 的 plainSnippet（把大纲预览压成纯文字）; 依赖 lib/i18n 的 Lang 类型
+ * [OUTPUT]: 对外提供 toTurns / countAsks（把 bb 的对话大纲切成“一轮要求 + 结论”）、outlineKey / freshness / briefingLanguage（存盘的速览是否落后于当前大纲与界面语言）、buildDigest（按语言拼喂给模型的全程提要）、briefingSystemPrompt（en / zh 两版提示词）、parseBriefing（按语言校验并截短模型输出）、briefingSchema 与 Briefing 类型
  * [POS]: lib 的“全程速览”纯逻辑; 消费者: briefings.ts（服务端生成）、components/peek.tsx（判断速览是否落后）; 与 search.ts 的边界: search 的 buildRecap 是不花 token 的兜底摘要，这里是交给模型写的那一份的输入与输出
  * [PROTOCOL]: 变更时更新此头部,然后检查所在目录 CLAUDE.md
  */
 import { z } from "zod";
+import type { Lang } from "./i18n";
 import { meaningfulItems, plainSnippet, type OutlineItem } from "./search";
 
 /** 提示词或输出结构变了就加一：存盘的旧速览会被视为过期并重写 */
-export const BRIEFING_VERSION = 3;
+export const BRIEFING_VERSION = 4;
 
 export const briefingSchema = z.object({
   /** 这条对话在做什么，一句话 */
@@ -38,9 +39,11 @@ export type BriefingStage = Briefing["stages"][number];
  * 存盘的速览。
  * - outlineKey: 写的时候对话大纲的指纹，用来判断之后有没有新消息（新要求、新答复、子对话回报都算）
  * - askCount:   写的时候读到第几条要求，只用来说“落后了几轮”
+ * - language:   用哪种语言写的；加这个字段之前存的都是中文，缺省按 zh 算。语言和当前界面不一致就算落后（要重写），也不拿出来显示
  */
 export const storedBriefingSchema = briefingSchema.extend({
   version: z.number(),
+  language: z.enum(["en", "zh"]).optional(),
   outlineKey: z.string(),
   askCount: z.number(),
   generatedAt: z.number(),
@@ -94,8 +97,15 @@ export type Freshness =
   /** 之后又有了新消息；newAsks 是其中用户新提的要求数（0 = 只有新答复，比如子对话回报后的续写） */
   | { state: "behind"; newAsks: number };
 
-/** 存盘的速览相对当前大纲是否落后。服务端据此决定要不要重写，卡片据此决定“现在 / 等你 / 下一步”还能不能信 */
-export function freshness(stored: Pick<StoredBriefing, "version" | "outlineKey" | "askCount">, items: readonly OutlineItem[]): Freshness {
+/** 存盘的速览用的语言（字段出现之前写的都是中文） */
+export const briefingLanguage = (stored: Pick<StoredBriefing, "language">): Lang => stored.language ?? "zh";
+
+/**
+ * 存盘的速览相对当前大纲是否落后。服务端据此决定要不要重写，卡片据此决定“现在 / 等你 / 下一步”还能不能信。
+ * 传了 language 时，语言不一致也算落后（newAsks 为 0）：换了界面语言，下一次就按新语言重写。
+ */
+export function freshness(stored: Pick<StoredBriefing, "version" | "outlineKey" | "askCount" | "language">, items: readonly OutlineItem[], language?: Lang): Freshness {
+  if (language !== undefined && briefingLanguage(stored) !== language) return { state: "behind", newAsks: 0 };
   if (stored.version === BRIEFING_VERSION && stored.outlineKey === outlineKey(items)) return { state: "fresh" };
   return { state: "behind", newAsks: Math.max(0, countAsks(items) - stored.askCount) };
 }
@@ -108,23 +118,28 @@ const SHORT_REPLY = 80;
  * 喂给模型的全程提要：每一轮的要求 + 答复开头，按时间顺序编号。
  * 读的是整条对话，而不是首尾几条：36 轮的对话也只有几千字。
  */
-export function buildDigest(items: readonly OutlineItem[], options: { active: boolean }): string {
+const DIGEST_TEXT: Record<Lang, { ask: string; reply: string; active: string; idle: string; state: (s: string) => string }> = {
+  zh: { ask: "要求：", reply: "答复：", active: "助手正在处理最后一条要求，尚未答完", idle: "助手已答完最后一条要求，等用户回应", state: (s) => `（当前状态：${s}）` },
+  en: { ask: "Request: ", reply: "Reply: ", active: "the assistant is still working on the last request", idle: "the assistant has answered the last request and is waiting for the user", state: (s) => `(Current state: ${s})` },
+};
+
+export function buildDigest(items: readonly OutlineItem[], options: { active: boolean; language?: Lang }): string {
+  const text = DIGEST_TEXT[options.language ?? "zh"];
   const turns = toTurns(items);
   const render = (shortenBefore: number) =>
     turns
       .map((turn, index) => {
         const reply = turn.reply && index < shortenBefore && turn.reply.length > SHORT_REPLY ? `${turn.reply.slice(0, SHORT_REPLY)}…` : turn.reply;
-        return reply ? `${index + 1}. 要求：${turn.ask}\n   答复：${reply}` : `${index + 1}. 要求：${turn.ask}`;
+        return reply ? `${index + 1}. ${text.ask}${turn.ask}\n   ${text.reply}${reply}` : `${index + 1}. ${text.ask}${turn.ask}`;
       })
       .join("\n");
   let body = render(0);
   // 最近 6 轮始终保留完整答复：它们决定了“现在停在哪”
   if (body.length > DIGEST_BUDGET) body = render(Math.max(0, turns.length - 6));
-  const state = options.active ? "助手正在处理最后一条要求，尚未答完" : "助手已答完最后一条要求，等用户回应";
-  return `${body}\n\n（当前状态：${state}）`;
+  return `${body}\n\n${text.state(options.active ? text.active : text.idle)}`;
 }
 
-export const BRIEFING_SYSTEM_PROMPT = `你为一条 AI 编程对话写“进展速览”，显示在侧边栏的悬停卡片上。读者就是这条对话的用户本人，他同时开着几十条对话，需要 5 秒内想起这条在干什么、到哪了。
+const ZH_SYSTEM_PROMPT = `你为一条 AI 编程对话写“进展速览”，显示在侧边栏的悬停卡片上。读者就是这条对话的用户本人，他同时开着几十条对话，需要 5 秒内想起这条在干什么、到哪了。
 
 输入是整条对话的提要：每一轮用户的要求，以及助手答复的开头。
 
@@ -142,7 +157,32 @@ export const BRIEFING_SYSTEM_PROMPT = `你为一条 AI 编程对话写“进展�
 - 被否决或放弃的方向用 dropped，note 写为什么放弃
 - 只写输入里有依据的事实，不猜测结果
 - 这是写给读者本人看的：需要提到他时用“你”（例如“等你选方向”），不要写“用户”“用户”
-- 用读者使用的语言，用大白话，不堆术语`;
+- 所有字段一律用简体中文写，用大白话，不堆术语；代码标识符、文件名、分支名保持原样`;
+
+const EN_SYSTEM_PROMPT = `You write a "progress briefing" for one AI coding conversation. It appears on a hover card in the sidebar. The reader is the person who had this conversation; they keep dozens of conversations open and need to recall in 5 seconds what this one is doing and where it stands.
+
+The input is a digest of the whole conversation: each request the user made, and the start of each reply from the assistant.
+
+Output exactly one JSON object, with no explanation and no code fence:
+{
+  "about": "what this conversation is doing, one sentence, at most 12 words",
+  "stages": [{"title": "stage name, at most 6 words", "state": "done | doing | dropped", "note": "the outcome or conclusion of this stage, at most 14 words"}],
+  "now": "where it stands right now, at most 16 words",
+  "waiting": "the decision or reply needed from the reader, at most 14 words; write null if none",
+  "next": "the most likely next step, at most 12 words; write null if unsure"
+}
+
+Rules:
+- Group the whole conversation into 1 to 6 stages by topic, in time order; a conversation with only one or two turns needs 1 or 2 stages; small talk and pure questions are not stages of their own
+- Use dropped for directions that were rejected or abandoned, and say why in the note
+- Only state facts supported by the input; do not guess outcomes
+- This is written for the reader themselves: address them as "you" (for example "waiting for you to pick a direction"), never "the user"
+- Write every field in plain English only, with no Chinese characters, even if the conversation is in another language; keep code identifiers, file names and branch names as they are`;
+
+/** 交给模型的系统提示词：所选语言写所有字段（中文版沿用原来的提示词） */
+export function briefingSystemPrompt(language: Lang): string {
+  return language === "en" ? EN_SYSTEM_PROMPT : ZH_SYSTEM_PROMPT;
+}
 
 const clip = (text: string, max: number) => {
   const flat = text.replace(/\s+/g, " ").trim();
@@ -151,8 +191,15 @@ const clip = (text: string, max: number) => {
 /** 模型有时把“没有”写成字符串 */
 const orNull = (value: unknown) => (typeof value !== "string" || /^(null|无|没有|none|n\/a)?$/i.test(value.trim()) ? null : value);
 
+/** 每个字段显示的字符上限：英文一个词约 5–6 个字符，同样的信息量要宽一倍多 */
+const CLIP_LIMITS: Record<Lang, { about: number; title: number; note: number; now: number; waiting: number; next: number }> = {
+  zh: { about: 40, title: 20, note: 44, now: 48, waiting: 44, next: 40 },
+  en: { about: 96, title: 44, note: 100, now: 110, waiting: 100, next: 92 },
+};
+
 /** 校验并收紧模型的输出：容忍代码围栏和前后多余的话；结构不对返回 null（宁可不显示，也不显示半截） */
-export function parseBriefing(text: string): Briefing | null {
+export function parseBriefing(text: string, language: Lang = "zh"): Briefing | null {
+  const max = CLIP_LIMITS[language];
   const start = text.indexOf("{");
   const end = text.lastIndexOf("}");
   if (start < 0 || end <= start) return null;
@@ -168,10 +215,10 @@ export function parseBriefing(text: string): Briefing | null {
   if (!parsed.success) return null;
   const value = parsed.data;
   return {
-    about: clip(value.about, 40),
-    stages: value.stages.slice(0, 6).map((stage) => ({ title: clip(stage.title, 20), state: stage.state, note: clip(stage.note, 44) })),
-    now: clip(value.now, 48),
-    waiting: value.waiting ? clip(value.waiting, 44) : null,
-    next: value.next ? clip(value.next, 40) : null,
+    about: clip(value.about, max.about),
+    stages: value.stages.slice(0, 6).map((stage) => ({ title: clip(stage.title, max.title), state: stage.state, note: clip(stage.note, max.note) })),
+    now: clip(value.now, max.now),
+    waiting: value.waiting ? clip(value.waiting, max.waiting) : null,
+    next: value.next ? clip(value.next, max.next) : null,
   };
 }

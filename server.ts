@@ -1,11 +1,12 @@
 /**
- * [INPUT]: 依赖 bb.sdk.projects / bb.sdk.environments 读取项目源与 bb 记录的起点分支; 依赖 host.ts 的 scanLineage 在各机器上读 git、writeBriefing 调网关或本机 claude; 依赖 briefings.ts 的速览调度; 依赖 bb.settings 的四项速览设置（开关、网关地址、网关上按顺序尝试的模型列表、兜底的 claude 模型）
- * [OUTPUT]: 对外提供 serverContract.lineage RPC（每个项目的分支血缘扫描结果 + bb 已登记环境路径）与 serverContract.briefing RPC（读一条对话存盘的速览）; 默认导出插件工厂
+ * [INPUT]: 依赖 bb.sdk.projects / bb.sdk.environments 读取项目源与 bb 记录的起点分支; 依赖 host.ts 的 scanLineage 在各机器上读 git、writeBriefing 调网关或本机 claude; 依赖 briefings.ts 的速览调度; 依赖 bb.settings 的五项设置（界面语言 language，速览的开关、网关地址、网关上按顺序尝试的模型列表、兜底的 claude 模型）; 依赖 lib/i18n 的设置项英文文案; 依赖 bb.storage.kv 记住前端报上来的界面语言
+ * [OUTPUT]: 对外提供 serverContract.lineage RPC（每个项目的分支血缘扫描结果 + bb 已登记环境路径）、serverContract.briefing RPC（读一条对话存盘的速览）与 serverContract.reportLanguage RPC（前端报告解析出的界面语言，auto 模式下决定速览语言、设置页标签固定英文）; 默认导出插件工厂
  * [POS]: 插件服务端汇总层; 消费者: app.tsx、components/peek.tsx; 与 host.ts 的边界: 本文件不执行命令，只负责收集 bb 侧事实、调度 host、缓存; 与 briefings.ts 的边界: 速览何时写、写哪条都在 briefings，这里只接线
  * [PROTOCOL]: 变更时更新此头部,然后检查所在目录 CLAUDE.md
  */
 import type { BbPluginApi } from "@get-bb/plugin-sdk";
 import { createBriefingService, parseModelList, type BriefingSettings } from "./briefings";
+import { LANGUAGE_OPTION_LABELS, LANGUAGE_SETTINGS, SETTINGS_TEXT, type Lang } from "./lib/i18n";
 import {
   hostContract,
   serverContract,
@@ -22,6 +23,11 @@ const SCAN_TIMEOUT_MS = 60_000;
 const DEFAULT_GATEWAY_URL = "http://127.0.0.1:3425";
 const DEFAULT_GATEWAY_MODELS = ["workbuddy/deepseek-v4.1-flash", "opencode-zen/deepseek-v4.1-flash-free"];
 const DEFAULT_CLAUDE_MODEL = "haiku";
+/** 前端最近一次报上来的界面语言（en / zh） */
+const UI_LANGUAGE_KEY = "ui-language";
+/** auto 模式下界面语言变了：稳定这么久才按新语言补写速览，且这段冷却内最多补写一次 */
+const LANGUAGE_SETTLE_MS = 60_000;
+const LANGUAGE_BACKFILL_COOLDOWN_MS = 30 * 60_000;
 
 type EnvironmentRecord = {
   id: string;
@@ -48,38 +54,32 @@ function recordedBaseOf(env: EnvironmentRecord): string | null {
 
 export default async function plugin(bb: BbPluginApi) {
   const host = bb.hosts.experimental_client({ contract: hostContract });
+  // 前端上次报上来的界面语言（auto 模式下决定速览用哪种语言）；还没报过就按英文
+  let uiLanguage: Lang = (await bb.storage.kv.get<Lang>(UI_LANGUAGE_KEY).catch(() => undefined)) === "zh" ? "zh" : "en";
+  // 设置页由 bb 渲染、schema 启动时一次定下，不能随语言切换：标签固定英文
+  const text = SETTINGS_TEXT;
   // 速览走用户的模型额度，所以给一个随时能关的开关
   const settings = bb.settings.define({
-    briefingEnabled: {
-      type: "boolean",
-      label: "用小模型写进展速览",
-      description: "每轮对话结束后，在后台让小模型读完整条对话的提要，写一份分阶段的速览，显示在悬停卡片上。先按顺序试下面网关上的模型，都不行再用本机的 Claude。关闭后卡片只显示不花额度的摘要。",
-      default: true,
+    language: {
+      type: "select",
+      ...text.language,
+      options: [...LANGUAGE_SETTINGS],
+      experimental_optionLabels: LANGUAGE_OPTION_LABELS,
+      default: "auto",
     },
-    briefingGatewayUrl: {
-      type: "string",
-      label: "优先使用的模型网关",
-      description: `OpenAI 兼容网关的地址（默认本机 Magpie ${DEFAULT_GATEWAY_URL}）。网关连不上时冷却 1 分钟、期间直接用本机 Claude。注意：对话提要会发给网关背后的模型服务商。留空则只用本机 Claude。`,
-      default: DEFAULT_GATEWAY_URL,
-    },
-    briefingGatewayModel: {
-      type: "string",
-      label: "网关上的模型（按顺序）",
-      description: `网关 /v1/models 列出的模型 id，逗号分隔、按顺序尝试（只写一个也行）：某个模型超时、出错或写得不合格就试下一个，全都不行再用本机 Claude；返回 429 的模型按 Retry-After 冷却（缺省 15 分钟，最多 2 小时），冷却期内跳过。默认 ${DEFAULT_GATEWAY_MODELS.join(", ")}。`,
-      default: DEFAULT_GATEWAY_MODELS.join(", "),
-    },
-    briefingModel: {
-      type: "string",
-      label: "兜底用的 Claude 模型",
-      description: `网关上的模型都不可用时传给本机 claude --model 的名字，默认 ${DEFAULT_CLAUDE_MODEL}。`,
-      default: DEFAULT_CLAUDE_MODEL,
-    },
+    briefingEnabled: { type: "boolean", ...text.briefingEnabled, default: true },
+    briefingGatewayUrl: { type: "string", ...text.briefingGatewayUrl, default: DEFAULT_GATEWAY_URL },
+    briefingGatewayModel: { type: "string", ...text.briefingGatewayModel, default: DEFAULT_GATEWAY_MODELS.join(", ") },
+    briefingModel: { type: "string", ...text.briefingModel, default: DEFAULT_CLAUDE_MODEL },
   });
+  /** 速览实际用的语言：设置为 en / zh 时直接用；auto 时只有前端知道浏览器语言，用它报上来的值 */
+  const briefingLanguageOf = (setting: string): Lang => (setting === "en" || setting === "zh" ? setting : uiLanguage);
   const briefingSettings = async (): Promise<BriefingSettings> => {
     const values = await settings.get();
     const gatewayUrl = values.briefingGatewayUrl.trim();
     return {
       enabled: values.briefingEnabled,
+      language: briefingLanguageOf(values.language),
       model: values.briefingModel.trim() || DEFAULT_CLAUDE_MODEL,
       gateway: gatewayUrl ? { baseUrl: gatewayUrl, models: parseModelList(values.briefingGatewayModel, DEFAULT_GATEWAY_MODELS) } : null,
     };
@@ -89,10 +89,36 @@ export default async function plugin(bb: BbPluginApi) {
     (hostId, input, timeoutMs) => host.call("writeBriefing", input, { hostId, timeoutMs }),
     briefingSettings,
   );
-  // 刚打开开关时补写一遍
+  // 刚打开开关、或者速览语言变了：补写一遍（补写有条数上限，旧语言的速览在此之前不显示）
   settings.onChange((next, prev) => {
-    if (next.briefingEnabled && !prev.briefingEnabled) void briefings.backfill().catch(() => undefined);
+    const languageChanged = briefingLanguageOf(next.language) !== briefingLanguageOf(prev.language);
+    if ((next.briefingEnabled && !prev.briefingEnabled) || (next.briefingEnabled && languageChanged)) void briefings.backfill().catch(() => undefined);
   });
+  /**
+   * 前端解析出的界面语言（auto 时由浏览器语言决定），正在用的窗口说了算（前端在挂载与窗口获得焦点时报告）。
+   * 记下来；auto 模式下新语言稳定 1 分钟后补写一次（30 分钟内最多一次，几个语言不同的窗口来回切换时不会反复补写）。
+   */
+  let languageTimer: ReturnType<typeof setTimeout> | undefined;
+  let lastLanguageBackfill = 0;
+  bb.onDispose(() => clearTimeout(languageTimer));
+  async function reportLanguage(language: Lang): Promise<{ ok: true }> {
+    if (language === uiLanguage) return { ok: true };
+    uiLanguage = language;
+    await bb.storage.kv.set(UI_LANGUAGE_KEY, language);
+    // auto 模式下速览随之换语言：新语言稳定 1 分钟后补写一次（旧语言的速览在此之前不显示）；
+    // 30 分钟内最多一次，开着几个语言不同的窗口来回切换时不会反复补写
+    clearTimeout(languageTimer);
+    languageTimer = setTimeout(() => {
+      void (async () => {
+        const values = await settings.get();
+        if (uiLanguage !== language || !values.briefingEnabled || values.language !== "auto") return;
+        if (Date.now() - lastLanguageBackfill < LANGUAGE_BACKFILL_COOLDOWN_MS) return;
+        lastLanguageBackfill = Date.now();
+        await briefings.backfill();
+      })().catch(() => undefined);
+    }, LANGUAGE_SETTLE_MS);
+    return { ok: true };
+  }
 
   let cache: { at: number; value: ProjectLineage[] } | null = null;
   let inflight: Promise<ProjectLineage[]> | null = null;
@@ -193,5 +219,6 @@ export default async function plugin(bb: BbPluginApi) {
       generatedAt: Date.now(),
     }),
     briefing: ({ threadId }) => briefings.view(threadId),
+    reportLanguage: ({ language }) => reportLanguage(language),
   });
 }

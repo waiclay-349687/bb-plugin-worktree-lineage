@@ -1,11 +1,12 @@
 /**
  * [INPUT]: 依赖 bb.sdk.threads（对话大纲、列表）与 bb.sdk.environments（对话在哪台机器）、bb.events 的 thread.idle / thread.deleted、bb.storage.kv 存盘、bb.log 记录命中的通道与跳过 / 失败的网关模型、调用方注入的 callModel（经 host.ts 的 writeBriefing 调网关或本机 claude）; 依赖 lib/briefing 的提要与解析
- * [OUTPUT]: 对外提供 createBriefingService(bb, callModel, getSettings): { view(threadId), backfill() } — 在后台为每条对话写“全程速览”并存盘；view 给界面一次性取回速览、是否落后、兜底摘要（只读）; generateBriefing(callModel, hostId, request, settings, cooldowns, now): 按顺序试网关模型链（跳过冷却中的）、全不行再兜底本机 claude 的一次生成（不依赖 bb，可单测）; parseModelList: 逗号分隔的有序模型列表; CooldownTable / GatewayStep 类型
- * [POS]: 插件服务端的速览调度; 消费者: server.ts; 与 lib/briefing.ts 的边界: 这里决定“何时写、写哪条、按什么顺序走哪条通道、哪个网关模型在冷却、写完存哪”，提示词与输出校验在 briefing; 与 host.ts 的边界: 这里不执行任何命令，回退决策在这里、执行在 host
+ * [OUTPUT]: 对外提供 createBriefingService(bb, callModel, getSettings): { view(threadId), backfill() } — 在后台为每条对话写“全程速览”并存盘；view 给界面一次性取回速览、是否落后、兜底摘要（只读）; generateBriefing(callModel, hostId, request, settings, cooldowns, now): 按顺序试网关模型链（按 settings.language 校验输出）（跳过冷却中的）、全不行再兜底本机 claude 的一次生成（不依赖 bb，可单测）; parseModelList: 逗号分隔的有序模型列表; CooldownTable / GatewayStep 类型
+ * [POS]: 插件服务端的速览调度; 消费者: server.ts; 与 lib/briefing.ts 的边界: 这里决定“何时写、写哪条、用哪种语言写、按什么顺序走哪条通道、哪个网关模型在冷却、写完存哪”（语言和当前界面不一致的存盘速览既不显示、也算落后要重写），提示词与输出校验在 briefing; 与 host.ts 的边界: 这里不执行任何命令，回退决策在这里、执行在 host
  * [PROTOCOL]: 变更时更新此头部,然后检查项目根 CLAUDE.md
  */
 import type { BbPluginApi } from "@get-bb/plugin-sdk";
-import { BRIEFING_SYSTEM_PROMPT, BRIEFING_VERSION, buildDigest, countAsks, freshness, outlineKey, parseBriefing, storedBriefingSchema, type Briefing, type StoredBriefing } from "./lib/briefing";
+import { BRIEFING_VERSION, briefingLanguage, briefingSystemPrompt, buildDigest, countAsks, freshness, outlineKey, parseBriefing, storedBriefingSchema, type Briefing, type StoredBriefing } from "./lib/briefing";
+import type { Lang } from "./lib/i18n";
 import type { ModelRunResult } from "./lib/model-run";
 import type { BriefingView, ModelRoute } from "./lib/contract";
 import { buildRecap, type OutlineItem } from "./lib/search";
@@ -15,6 +16,8 @@ export type CallModel = (hostId: string, input: { system: string; prompt: string
 
 export interface BriefingSettings {
   enabled: boolean;
+  /** 速览用哪种语言写：设置为 en / zh 时直接用，auto 时用前端报上来的界面语言 */
+  language: Lang;
   /** 兜底用的本机 claude 模型 */
   model: string;
   /** 优先使用的 OpenAI 兼容网关与其上按顺序尝试的模型；null = 不走网关，直接用 claude */
@@ -65,7 +68,7 @@ export async function generateBriefing(
   callModel: CallModel,
   hostId: string,
   request: { system: string; prompt: string },
-  settings: Pick<BriefingSettings, "model" | "gateway">,
+  settings: Pick<BriefingSettings, "model" | "gateway"> & { language?: Lang },
   cooldowns: CooldownTable = new Map(),
   now: () => number = Date.now,
 ): Promise<GenerateOutcome> {
@@ -74,7 +77,7 @@ export async function generateBriefing(
       (error): ModelRunResult => ({ status: "failed", message: error instanceof Error ? error.message : String(error) }),
     );
     if (result.status !== "ok") return { ok: false as const, reason: result.message, cooldown: result.cooldown };
-    const briefing = parseBriefing(result.text);
+    const briefing = parseBriefing(result.text, settings.language ?? "zh");
     if (!briefing) return { ok: false as const, reason: `unparseable model output: ${result.text.replace(/\s+/g, " ").slice(0, 120)}`, cooldown: undefined };
     return { ok: true as const, briefing, durationMs: result.durationMs, costUsd: result.costUsd };
   };
@@ -168,9 +171,11 @@ export function createBriefingService(bb: BbPluginApi, callModel: CallModel, get
       ),
       getSettings(),
     ]);
+    // 换了界面语言之后，旧语言写的速览不拿出来（不然就是另一种语言混进界面）；卡片先用兜底摘要，下一轮按新语言重写
+    const usable = stored && briefingLanguage(stored) === settings.language ? stored : null;
     return {
-      briefing: stored,
-      freshness: stored ? freshness(stored, outline) : null,
+      briefing: usable,
+      freshness: usable ? freshness(usable, outline) : null,
       recap: buildRecap(outline),
       enabled: settings.enabled,
     };
@@ -203,7 +208,7 @@ export function createBriefingService(bb: BbPluginApi, callModel: CallModel, get
     // 任何新消息都算新进展：不只是新要求，子对话回报之后的续写也要重写
     const key = outlineKey(outline.items);
     const stored = await read(threadId);
-    if (stored && freshness(stored, outline.items).state === "fresh") return;
+    if (stored && freshness(stored, outline.items, settings.language).state === "fresh") return;
     const lastFailure = failed.get(threadId);
     if (lastFailure && lastFailure.key === key && Date.now() - lastFailure.at < RETRY_AFTER_MS) return;
 
@@ -217,7 +222,7 @@ export function createBriefingService(bb: BbPluginApi, callModel: CallModel, get
     const outcome = await generateBriefing(
       callModel,
       environment.hostId,
-      { system: BRIEFING_SYSTEM_PROMPT, prompt: buildDigest(outline.items, { active: false }) },
+      { system: briefingSystemPrompt(settings.language), prompt: buildDigest(outline.items, { active: false, language: settings.language }) },
       settings,
       cooldowns,
     );
@@ -237,7 +242,7 @@ export function createBriefingService(bb: BbPluginApi, callModel: CallModel, get
     }
     failed.delete(threadId);
     consecutiveFailures = 0;
-    await bb.storage.kv.set(KEY(threadId), { ...outcome.briefing, version: BRIEFING_VERSION, outlineKey: key, askCount, generatedAt: Date.now() } satisfies StoredBriefing);
+    await bb.storage.kv.set(KEY(threadId), { ...outcome.briefing, version: BRIEFING_VERSION, language: settings.language, outlineKey: key, askCount, generatedAt: Date.now() } satisfies StoredBriefing);
     const cost = outcome.costUsd === null ? "" : `, $${outcome.costUsd}`;
     const fallback = outcome.steps.length > 0 ? " (fallback)" : "";
     bb.log.info(`briefing written for ${threadId} via ${outcome.via} ${outcome.model}${fallback} (${askCount} asks, ${outcome.durationMs}ms${cost})${skippedNote}`);
