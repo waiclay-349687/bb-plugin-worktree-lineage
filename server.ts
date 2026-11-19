@@ -1,16 +1,17 @@
 /**
  * [INPUT]: 依赖 bb.sdk.projects / bb.sdk.environments 读取项目源与 bb 记录的起点分支; 依赖 host.ts 的 scanLineage 在各机器上读 git、writeBriefing 调网关或本机 claude; 依赖 briefings.ts 的速览调度; 依赖 bb.settings 的五项设置（界面语言 language，速览的开关、网关地址、网关上按顺序尝试的模型列表、兜底的 claude 模型）; 依赖 lib/i18n 的设置项英文文案; 依赖 bb.storage.kv 记住前端报上来的界面语言
- * [OUTPUT]: 对外提供 serverContract.lineage RPC（每个项目的分支血缘扫描结果 + bb 已登记环境路径）、serverContract.briefing RPC（读一条对话存盘的速览）与 serverContract.reportLanguage RPC（前端报告解析出的界面语言，auto 模式下决定速览语言、设置页标签固定英文）; 默认导出插件工厂
+ * [OUTPUT]: 对外提供 serverContract.lineage RPC（每个项目的分支血缘扫描结果 + bb 已登记环境路径）、serverContract.briefing RPC（读一条对话存盘的速览）、serverContract.settingsStatus / updateSettings / resetBriefingCooldowns RPC（设置页读状态、改语言与速览开关、清冷却）与 serverContract.reportLanguage RPC（前端报告解析出的界面语言，auto 模式下决定速览语言、设置页标签固定英文）; 默认导出插件工厂
  * [POS]: 插件服务端汇总层; 消费者: app.tsx、components/peek.tsx; 与 host.ts 的边界: 本文件不执行命令，只负责收集 bb 侧事实、调度 host、缓存; 与 briefings.ts 的边界: 速览何时写、写哪条都在 briefings，这里只接线
  * [PROTOCOL]: 变更时更新此头部,然后检查所在目录 CLAUDE.md
  */
 import type { BbPluginApi } from "@get-bb/plugin-sdk";
 import { createBriefingService, parseModelList, type BriefingSettings } from "./briefings";
-import { LANGUAGE_OPTION_LABELS, LANGUAGE_SETTINGS, SETTINGS_TEXT, type Lang } from "./lib/i18n";
+import { isLanguageSetting, LANGUAGE_OPTION_LABELS, LANGUAGE_SETTINGS, SETTINGS_TEXT, type Lang, type LanguageSetting } from "./lib/i18n";
 import {
   hostContract,
   serverContract,
   type ProjectLineage,
+  type SettingsStatus,
 } from "./lib/contract";
 
 /** 扫描结果缓存时长：侧边栏轮询频繁，git 扫描不必每次都跑 */
@@ -120,6 +121,19 @@ export default async function plugin(bb: BbPluginApi) {
     return { ok: true };
   }
 
+  /** 设置页的状态快照：设置值来自 bb.settings（与声明式设置、CLI 同一份），运行状态来自速览服务 */
+  async function settingsStatus(): Promise<SettingsStatus> {
+    const [values, briefing, effective] = await Promise.all([settings.get(), briefings.status(), briefingSettings()]);
+    return {
+      language: isLanguageSetting(values.language) ? values.language : "auto",
+      briefingLanguage: effective.language,
+      briefingEnabled: values.briefingEnabled,
+      gateway: effective.gateway,
+      claudeModel: effective.model,
+      briefing,
+    };
+  }
+
   let cache: { at: number; value: ProjectLineage[] } | null = null;
   let inflight: Promise<ProjectLineage[]> | null = null;
 
@@ -220,5 +234,17 @@ export default async function plugin(bb: BbPluginApi) {
     }),
     briefing: ({ threadId }) => briefings.view(threadId),
     reportLanguage: ({ language }) => reportLanguage(language),
+    settingsStatus: () => settingsStatus(),
+    updateSettings: async (patch) => {
+      const values: { language?: LanguageSetting; briefingEnabled?: boolean } = {};
+      if (patch.language !== undefined) values.language = patch.language;
+      if (patch.briefingEnabled !== undefined) values.briefingEnabled = patch.briefingEnabled;
+      if (Object.keys(values).length > 0) await settings.experimental_set(values);
+      return settingsStatus();
+    },
+    resetBriefingCooldowns: async () => {
+      await briefings.resetCooldowns();
+      return settingsStatus();
+    },
   });
 }

@@ -4,8 +4,8 @@ import { LANGUAGE_OPTION_LABELS, MESSAGES, relativeTime, resolveLanguage, SETTIN
 import type { OutlineItem } from "../lib/search";
 
 const HAN = /[一-鿿]/;
-/** 中文界面里允许出现的英文：专有名词与按键名，别的英文词一律不许出现 */
-const ZH_ALLOWED_WORDS = new Set(["Git", "BB", "HEAD", "Alt", "Option"]);
+/** 中文界面里允许出现的英文：专有名词（含产品名 Claude）与按键名，别的英文词一律不许出现 */
+const ZH_ALLOWED_WORDS = new Set(["Git", "BB", "HEAD", "Alt", "Option", "Claude"]);
 /** 用户点名要防的“英文界面词”，单独再查一遍，失败时信息更直观 */
 const ZH_BANNED = /Settled|Settle|Unsettle|worktree|Conversation|Branch|Tree|Merged|Idle|Outside|Main checkout|\bPR\b|\bfrom\b|\bnow\b/i;
 
@@ -16,8 +16,9 @@ function render(messages: Messages, sample: string): string[] {
     if (key === "dispatchedCount") return (value as Messages["dispatchedCount"])(3, [messages.childPart(1, messages.childRunning)]);
     if (key === "childPart") return (value as Messages["childPart"])(2, messages.childDone);
     if (key === "pullRequest") return (value as Messages["pullRequest"])(12, messages.prMerged);
-    const fn = value as (arg: unknown) => string;
-    return /^(time|turns|uncommitted|behind|fold|foot|nodeAhead|attention|highlight)/.test(key) ? fn(3) : fn(sample);
+    const fn = value as (a: unknown, b?: unknown) => string;
+    if (/^(time|turns|uncommitted|behind|fold|foot|nodeAhead|attention|highlight|setToday|setQueue|setRetry|settledCount)/.test(key)) return fn(3, 300);
+    return fn(sample, sample);
   });
 }
 
@@ -29,7 +30,7 @@ describe("界面词典：零混用", () => {
   });
 
   it("英文词典渲染出来的每一条都不含汉字（含单复数分支）", () => {
-    const texts = [...render(MESSAGES.en, "feat/x"), ...[1, 2].flatMap((n) => [MESSAGES.en.turns(n), MESSAGES.en.nodeAhead(n), MESSAGES.en.foldChildrenOpen(n), MESSAGES.en.highlightDispatched(n)])];
+    const texts = [...render(MESSAGES.en, "feat/x"), ...[1, 2].flatMap((n) => [MESSAGES.en.turns(n), MESSAGES.en.nodeAhead(n), MESSAGES.en.foldChildrenOpen(n), MESSAGES.en.highlightDispatched(n), MESSAGES.en.setQueue(n), MESSAGES.en.setRetry(n), MESSAGES.en.settledCount(n)])];
     expect(texts.filter((text) => HAN.test(text))).toEqual([]);
   });
 

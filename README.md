@@ -45,7 +45,8 @@ One alignment rule throughout: a child's icon lines up with its parent's text, a
   Priority is error › waiting for reply › draft › finished-unread. A running thread gets a thin flowing border instead of a color.
 - **Hover actions in place:** regenerate title, archive, and more. Right-click opens bb's full thread menu.
 - **Quick filter:** press `/` and type. Results come in three groups: title or branch, mentioned in messages, and archived; the last two come from bb's own search.
-- **Follows any theme.** Colors come only from bb theme variables. On touch screens, action buttons are always visible and bigger.
+- **Follows any theme.** Colors come only from bb theme variables. On touch screens, buttons are bigger.
+- **Scrolls only vertically.** The list never moves sideways, even on a phone: overflow is clipped and touch gestures only pan up and down.
 
 ## Hover Briefings
 
@@ -148,6 +149,15 @@ bb plugin config worktree-lineage set briefingGatewayModel "my-provider/my-model
 bb plugin config worktree-lineage set briefingModel sonnet
 bb plugin config worktree-lineage unset briefingGatewayModel        # back to the default
 ```
+
+### Settings panel
+
+The plugin's page in bb (**Settings → Plugins → Worktree Lineage**) adds a **Status and quick actions** panel below bb's generated configuration form:
+- **Language**: one-tap switch between Auto, English and 简体中文. It applies immediately to the list and the panel.
+- **Hover briefings**: an on/off switch, plus live status. Status covers the route, the briefing language, the last briefing and today's count against the daily limit. It also lists any models cooling down, threads waiting to retry, and a pause after repeated failures, with a button to clear them.
+- **Settled threads**: how many threads are settled in this browser, and **Unsettle all**. This clears only this browser's records and never archives anything.
+
+The panel writes the same settings as the form above and as `bb plugin config`.
 
 ## Install
 

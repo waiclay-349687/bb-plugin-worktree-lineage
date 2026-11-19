@@ -47,6 +47,16 @@
   cursor: default;
   user-select: none;
   -webkit-user-select: none;
+  /*
+   * 列表只能上下滚，绝不左右移动（手机上尤其明显）：
+   * - 宽度严格等于宿主给的宽度，横向溢出一律裁掉（clip 不建滚动容器，也不把溢出算进宿主滚动容器的 scrollWidth）
+   * - 触摸手势只认竖直方向，横向不会把宿主的滚动容器拖动
+   */
+  max-width: 100%;
+  min-width: 0;
+  overflow-x: clip;
+  touch-action: pan-y;
+  overscroll-behavior-x: none;
 }
 .wl-root[data-compact="true"] {
   --wl-line1: 28px;
@@ -89,6 +99,7 @@
   display: flex;
   align-items: center;
   gap: 6px;
+  min-width: 0;
   position: sticky;
   top: 0;
   z-index: 4;
@@ -108,10 +119,12 @@
   pointer-events: none;
 }
 /* 两个按钮宽度不等：当前视图带文字，另一个只留图标（英文叫法长，两个都写出来顶栏放不下）；底色直接落在当前按钮上 */
+/* 顶栏放不下时（窄侧边栏、触屏下按钮变大）分段控件先让：当前视图的文字截成省略号，其余按钮保持原尺寸 */
 .wl-seg {
   position: relative;
   display: inline-flex;
-  flex: none;
+  flex: 0 1 auto;
+  min-width: 0;
   padding: 2px;
   border-radius: var(--wl-r-md);
   background: color-mix(in oklab, var(--ink) 7%, transparent);
@@ -140,6 +153,26 @@
 }
 .wl-seg button[aria-pressed="false"] .wl-seg-label {
   display: none;
+}
+.wl-seg button[aria-pressed="true"] {
+  flex: 0 1 auto;
+  min-width: 0;
+}
+.wl-seg button[aria-pressed="false"],
+.wl-seg button svg {
+  flex: none;
+}
+.wl-seg-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.wl-bar > :not(.wl-seg) {
+  flex-shrink: 0;
+}
+.wl-bar > .wl-grow {
+  flex-shrink: 1;
+  min-width: 0;
 }
 .wl-root[data-compact="true"] .wl-seg button {
   height: 30px;
@@ -1412,4 +1445,172 @@
     animation: none;
     transition: none;
   }
+}
+
+
+/* ── 插件设置页面板（components/settings-section.tsx） ──────────────
+   渲染在 bb 的设置页里，不在侧边栏：颜色只用宿主主题变量，跟随深浅色；圆角沿用 sm / md 两档 */
+.wl-set {
+  --wl-set-line: color-mix(in oklab, var(--ink, currentColor) 12%, transparent);
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  max-width: 100%;
+  font-size: var(--text-sm, 0.875rem);
+}
+.wl-set[data-busy="true"] {
+  cursor: progress;
+}
+.wl-set-intro {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: 2px;
+}
+.wl-set-heading {
+  margin: 0;
+  font-size: var(--text-sm, 0.875rem);
+  font-weight: 500;
+}
+.wl-set-block {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+.wl-set-block + .wl-set-block {
+  padding-top: 14px;
+  border-top: 1px solid var(--wl-set-line);
+}
+.wl-set-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px 12px;
+  min-width: 0;
+}
+.wl-set-title {
+  font-weight: 500;
+}
+.wl-set-hint {
+  margin: 0;
+  color: var(--muted-foreground);
+  font-size: var(--text-xs, 0.75rem);
+  line-height: 1.5;
+}
+.wl-set-quiet {
+  color: var(--muted-foreground);
+}
+.wl-set-mono {
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 0.92em;
+  overflow-wrap: anywhere;
+}
+.wl-set-seg {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 2px;
+  padding: 2px;
+  border: 1px solid var(--wl-set-line);
+  border-radius: calc(var(--radius, 0.5rem) - 2px);
+}
+.wl-set-seg button,
+.wl-set-btn {
+  height: 24px;
+  padding: 0 9px;
+  border-radius: calc(var(--radius, 0.5rem) - 4px);
+  font-size: var(--text-xs, 0.75rem);
+  white-space: nowrap;
+  color: var(--muted-foreground);
+  transition: background-color 0.15s ease, color 0.15s ease;
+}
+.wl-set-seg button:hover:not(:disabled),
+.wl-set-btn:hover:not(:disabled) {
+  color: inherit;
+  background: color-mix(in oklab, var(--ink, currentColor) 6%, transparent);
+}
+.wl-set-seg button[aria-checked="true"] {
+  color: inherit;
+  background: color-mix(in oklab, var(--ink, currentColor) 11%, transparent);
+}
+.wl-set-btn {
+  align-self: flex-start;
+  border: 1px solid var(--wl-set-line);
+  color: inherit;
+}
+.wl-set-seg button:disabled,
+.wl-set-btn:disabled,
+.wl-set-switch:disabled {
+  opacity: 0.6;
+}
+/* 开关：圆形滑块 + 文字（开 / 关），选中时用主题主色 */
+.wl-set-switch {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  font-size: var(--text-xs, 0.75rem);
+  color: var(--muted-foreground);
+}
+.wl-set-switch::before {
+  content: "";
+  order: -1;
+  width: 28px;
+  height: 16px;
+  border-radius: 999px;
+  background: color-mix(in oklab, var(--ink, currentColor) 18%, transparent);
+  transition: background-color 0.18s ease;
+}
+.wl-set-knob {
+  position: absolute;
+  width: 12px;
+  height: 12px;
+  margin-left: 2px;
+  border-radius: 999px;
+  background: var(--background, var(--canvas));
+  box-shadow: 0 1px 2px color-mix(in oklab, var(--ink, currentColor) 25%, transparent);
+  transition: transform 0.18s ease;
+}
+.wl-set-switch {
+  position: relative;
+}
+.wl-set-switch[aria-checked="true"]::before {
+  background: var(--primary);
+}
+.wl-set-switch[aria-checked="true"] .wl-set-knob {
+  transform: translateX(12px);
+}
+.wl-set-facts {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: 5px 14px;
+  margin: 4px 0 0;
+  font-size: var(--text-xs, 0.75rem);
+}
+.wl-set-facts[data-off="true"] {
+  opacity: 0.6;
+}
+.wl-set-facts dt {
+  color: var(--muted-foreground);
+}
+.wl-set-facts dd {
+  margin: 0;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.wl-set-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin: 0 0 6px;
+  padding: 0;
+  list-style: none;
+}
+.wl-set-warn {
+  color: var(--attention);
+}
+.wl-set-error {
+  margin: 0;
+  color: var(--destructive, var(--attention));
+  font-size: var(--text-xs, 0.75rem);
 }

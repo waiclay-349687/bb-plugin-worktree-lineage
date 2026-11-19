@@ -1,7 +1,7 @@
 /**
  * [INPUT]: 无外部依赖（纯数据 + 纯函数）
- * [OUTPUT]: 对外提供 Lang / LanguageSetting 类型、LANGUAGE_SETTINGS、LANGUAGE_OPTION_LABELS、resolveLanguage（auto / en / zh → en | zh）、MESSAGES（界面全部文案，en 与 zh 两本同构词典）、SETTINGS_TEXT（服务端设置项的英文标签与说明，bb 设置页不能随语言切换）、relativeTime（按语言的短相对时间）、LANGUAGE_STORAGE_KEY
- * [POS]: lib 的界面语言层; 消费者: components/i18n.tsx（解析语言、提供 useT）、app.tsx（槽位标题）、server.ts（设置项标签）、lib/view.ts（相对时间）; 与 lib/briefing.ts 的边界: 这里只管界面文案，交给模型的提示词按语言放在 briefing
+ * [OUTPUT]: 对外提供 Lang / LanguageSetting 类型、LANGUAGE_SETTINGS、LANGUAGE_OPTION_LABELS、resolveLanguage（auto / en / zh → en | zh）、MESSAGES（界面全部文案，en 与 zh 两本同构词典）、SETTINGS_TEXT（服务端设置项的英文标签与说明，bb 设置页不能随语言切换）、relativeTime / agoText（按语言的短相对时间、多久以前）、LANGUAGE_STORAGE_KEY
+ * [POS]: lib 的界面语言层; 消费者: components/i18n.tsx（解析语言、提供 useT）、app.tsx（槽位与设置分区的标题）、components/settings-section.tsx（设置面板）、server.ts（设置项标签）、lib/view.ts（相对时间）; 与 lib/briefing.ts 的边界: 这里只管界面文案，交给模型的提示词按语言放在 briefing
  * [PROTOCOL]: 变更时更新此头部,然后检查所在目录 CLAUDE.md
  *
  * 零混用规则：选了一种语言，界面上就只出现这种语言。英文词典里不能有汉字，中文词典里不能有英文界面词；
@@ -150,6 +150,47 @@ const en = {
   timeHours: ((n) => `${n}h`) as Count,
   timeDays: ((n) => `${n}d`) as Count,
   timeWeeks: ((n) => `${n}w`) as Count,
+  ago: ((time) => `${time} ago`) as Text,
+
+  // 设置页
+  settingsTitle: "Status and quick actions",
+  settingsDescription: "Live briefing status, plus one-tap switches for the same settings as above and for threads settled on this device.",
+  setLanguage: "Language",
+  setLanguageHint: "Applies right away to the list and to briefings written from now on.",
+  languageAuto: "Auto (follow BB)",
+  setBriefings: "Hover briefings",
+  setBriefingsHint: "Written in the background after each turn. Hovering only reads saved briefings and never calls a model.",
+  setBriefingsSwitch: "Write briefings",
+  setOn: "On",
+  setOff: "Off",
+  setToday: ((n, limit: number) => `${n} of ${limit} today`) as (n: number, limit: number) => string,
+  setRoute: "Route",
+  routeGateway: ((models) => `Gateway: ${models}, then local Claude`) as Text,
+  routeClaudeOnly: ((model) => `Local Claude only (${model})`) as Text,
+  setBriefingLanguage: "Briefing language",
+  briefingLanguageEn: "English",
+  briefingLanguageZh: "Chinese",
+  setLast: "Last briefing",
+  lastGateway: ((model, when: string) => `Gateway · ${model} · ${when}`) as (model: string, when: string) => string,
+  lastClaude: ((model, when: string) => `Local Claude · ${model} · ${when}`) as (model: string, when: string) => string,
+  lastFailed: ((when) => `Failed · ${when}`) as Text,
+  lastNone: "None since the plugin started",
+  setCooling: "Cooling down",
+  coolingGateway: "Gateway unreachable",
+  coolingLeft: ((time) => `${time} left`) as Text,
+  setQueue: ((n) => (n === 1 ? "1 queued" : `${n} queued`)) as Count,
+  setRetry: ((n) => (n === 1 ? "1 waiting to retry" : `${n} waiting to retry`)) as Count,
+  setPaused: "Paused after repeated failures",
+  setLimitReached: "Daily limit reached; resumes tomorrow (UTC)",
+  setReset: "Clear cooldowns and retry",
+  setSettled: "Settled threads",
+  setSettledHint: "Kept only in this browser. Settling never archives a thread or touches its environment.",
+  settledCount: ((n) => (n === 1 ? "1 thread settled on this device" : `${n} threads settled on this device`)) as Count,
+  settledNone: "No threads settled on this device",
+  unsettleAll: "Unsettle all",
+  setLoading: "Loading…",
+  setLoadFailed: "Couldn't load the plugin status",
+  setSaveFailed: "Couldn't save the setting",
 };
 
 export type Messages = typeof en;
@@ -262,6 +303,46 @@ const zh: Messages = {
   timeHours: (n) => `${n}小时`,
   timeDays: (n) => `${n}天`,
   timeWeeks: (n) => `${n}周`,
+  ago: (time) => `${time}前`,
+
+  settingsTitle: "状态与快捷操作",
+  settingsDescription: "速览的实时状态；上面几项设置与本机搁置记录的一键开关。",
+  setLanguage: "界面语言",
+  setLanguageHint: "立即作用于列表和之后写的速览。",
+  languageAuto: "自动（跟随 BB）",
+  setBriefings: "悬停速览",
+  setBriefingsHint: "每轮对话结束后在后台写好；悬停只读存好的速览，从不调用模型。",
+  setBriefingsSwitch: "写速览",
+  setOn: "开",
+  setOff: "关",
+  setToday: (n, limit) => `今天 ${n} / ${limit}`,
+  setRoute: "通道",
+  routeGateway: (models) => `网关：${models}，不行再用本机 Claude`,
+  routeClaudeOnly: (model) => `只用本机 Claude（${model}）`,
+  setBriefingLanguage: "速览语言",
+  briefingLanguageEn: "英文",
+  briefingLanguageZh: "中文",
+  setLast: "最近一条",
+  lastGateway: (model, when) => `网关 · ${model} · ${when}`,
+  lastClaude: (model, when) => `本机 Claude · ${model} · ${when}`,
+  lastFailed: (when) => `失败 · ${when}`,
+  lastNone: "插件启动后还没写过",
+  setCooling: "冷却中",
+  coolingGateway: "网关连不上",
+  coolingLeft: (time) => `还剩 ${time}`,
+  setQueue: (n) => `排队 ${n} 条`,
+  setRetry: (n) => `${n} 条等待重试`,
+  setPaused: "连续失败，已暂停",
+  setLimitReached: "今天的次数已用完，明天（按协调世界时）恢复",
+  setReset: "清除冷却并重试",
+  setSettled: "已搁置的对话",
+  setSettledHint: "只记在这个浏览器里；搁置从不归档对话，也不碰它的环境。",
+  settledCount: (n) => `本机已搁置 ${n} 条`,
+  settledNone: "本机没有已搁置的对话",
+  unsettleAll: "全部取消搁置",
+  setLoading: "读取中…",
+  setLoadFailed: "读取插件状态失败",
+  setSaveFailed: "设置保存失败",
 };
 
 export const MESSAGES: Record<Lang, Messages> = { en, zh };
@@ -276,6 +357,12 @@ export function relativeTime(at: number, now: number, lang: Lang): string {
   if (hours < 24) return t.timeHours(hours);
   const days = Math.floor(hours / 24);
   return days < 14 ? t.timeDays(days) : t.timeWeeks(Math.floor(days / 7));
+}
+
+/** 多久以前：5m ago / 5分钟前；不到一分钟直接写 now / 刚刚 */
+export function agoText(at: number, now: number, lang: Lang): string {
+  const time = relativeTime(at, now, lang);
+  return now - at < 60_000 ? time : MESSAGES[lang].ago(time);
 }
 
 /**

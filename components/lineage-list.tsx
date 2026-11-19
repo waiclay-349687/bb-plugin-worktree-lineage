@@ -1,5 +1,5 @@
 /**
- * [INPUT]: 依赖 @get-bb/plugin-sdk/app 的侧边栏线程数据、provider 图标、线程快捷操作与菜单、状态组件、导航; 依赖 server.ts 的 lineage RPC; 依赖 lib/tree 建树、lib/conversations（对话视图）与 lib/view（分支树视图）两个展示模型; 依赖 components/motion 的存在感列表与全局 FLIP 滑移; 依赖 components/i18n 的 LanguageProvider / useT / useLang（全部界面文案按界面语言从词典取）
+ * [INPUT]: 依赖 @get-bb/plugin-sdk/app 的侧边栏线程数据、provider 图标、线程快捷操作与菜单、状态组件、导航; 依赖 server.ts 的 lineage RPC; 依赖 lib/tree 建树、lib/conversations（对话视图）与 lib/view（分支树视图）两个展示模型; 依赖 components/motion 的存在感列表与全局 FLIP 滑移; 依赖 components/i18n 的 LanguageProvider / useT / useLang（全部界面文案按界面语言从词典取）; 依赖 lib/settle 的本机搁置存储约定（设置页“全部取消搁置”后经 SETTLED_CHANGED_EVENT 重读，列表加载完才清理过期记录）
  * [OUTPUT]: 对外提供 LineageList: experimental_threadList 槽位的列表组件
  * [POS]: 插件界面主体; 消费者: app.tsx; 与 lib 的边界: 谁挂在谁下面、怎么排序由 lib/conversations（对话视图：对话是主角，不出现分支）与 lib/view（分支树视图：分支是主行，对话是次级行）决定，这里只负责渲染与交互（折叠、视图切换、悬停快捷操作、轮询、入场/退场/重排/置顶动效）; 视觉全部在 styles.css，颜色只用宿主主题变量
  * [PROTOCOL]: 变更时更新此头部,然后检查所在目录 CLAUDE.md
@@ -33,7 +33,7 @@ import { activityOf, buildConversations, countDescendants, type Conversation } f
 import type { MotionPhase } from "@/lib/motion";
 import { branchLabel, buildLineageTree, collectAncestry, walkThreads, type BranchView } from "@/lib/tree";
 import { matchThreads } from "@/lib/search";
-import { isThreadSettled, needsUserAttention, nextAttentionId, orderByVisual, splitSettledConversations } from "@/lib/settle";
+import { isThreadSettled, needsUserAttention, nextAttentionId, orderByVisual, parseSettledMap, SETTLED_CHANGED_EVENT, SETTLED_STORAGE_KEY, settledToPrune, splitSettledConversations } from "@/lib/settle";
 import type { Messages } from "@/lib/i18n";
 import { LanguageProvider, useLang, useT } from "@/components/i18n";
 import { buildProjectView, pathLabels, relativeTime, rollupTone, rowColor, rowTone, toneOf, worktreeCleanupCommand, type RowColor, type ViewNode } from "@/lib/view";
@@ -53,7 +53,7 @@ interface PluginThreadListProps {
 const POLL_MS = 45_000;
 const STORAGE_VIEW = "worktree-lineage.mode";
 const STORAGE_COLLAPSED = "worktree-lineage.collapsed";
-const STORAGE_SETTLED = "worktree-lineage.settled";
+const STORAGE_SETTLED = SETTLED_STORAGE_KEY;
 /** 输入停顿多久才去问 bb 的官方搜索（它搜消息内容，要走服务器） */
 const SEARCH_DEBOUNCE_MS = 260;
 const SEARCH_LIMIT = 8;
@@ -96,18 +96,34 @@ function usePersistentMap(key: string) {
   return [map, set] as const;
 }
 
-/** 本地软收起（Settle）记录：threadId → 完结时间戳；纯插件本地状态，绝不触碰 bb 归档与磁盘工作区 */
+/** 本地软收起（Settle）记录：threadId → 收起时间戳；纯插件本地状态，绝不触碰 bb 归档与磁盘工作区 */
 function useSettledMap(key: string) {
   const [map, setMap] = useState<Record<string, number>>(() => {
     try {
-      const raw = JSON.parse(localStorage.getItem(key) ?? "{}") as Record<string, unknown>;
-      const clean: Record<string, number> = {};
-      for (const [id, ts] of Object.entries(raw)) if (typeof ts === "number" && Number.isFinite(ts)) clean[id] = ts;
-      return clean;
+      return parseSettledMap(localStorage.getItem(key));
     } catch {
       return {};
     }
   });
+  // 设置页“全部移回”或别的标签页改了记录：重读一遍
+  useEffect(() => {
+    const reload = () => {
+      try {
+        setMap(parseSettledMap(localStorage.getItem(key)));
+      } catch {
+        // 读不到就保持现状
+      }
+    };
+    const onStorage = (event: StorageEvent) => {
+      if (event.key === key) reload();
+    };
+    window.addEventListener(SETTLED_CHANGED_EVENT, reload);
+    window.addEventListener("storage", onStorage);
+    return () => {
+      window.removeEventListener(SETTLED_CHANGED_EVENT, reload);
+      window.removeEventListener("storage", onStorage);
+    };
+  }, [key]);
   const persist = useCallback(
     (updater: (prev: Record<string, number>) => Record<string, number>) =>
       setMap((prev) => {
@@ -203,7 +219,7 @@ export function LineageList(props: PluginThreadListProps) {
 function LineageListBody(props: PluginThreadListProps) {
   const tx = useT();
   const lang = useLang();
-  const { threads: allThreads, projects } = useSidebarThreads();
+  const { threads: allThreads, projects, status: threadsStatus } = useSidebarThreads();
   const { providers } = useProviders();
   const navigate = useBbNavigate();
   const [view, setView] = useState<ViewMode>(() => (localStorage.getItem(STORAGE_VIEW) === "lineage" ? "lineage" : "family"));
@@ -445,19 +461,11 @@ function LineageListBody(props: PluginThreadListProps) {
     [rawSettle, peekClose],
   );
 
-  // 自动清理已归档/删除、或因新活动而唤醒的软收起记录，防止 localStorage 堆积或日后意外回落
+  // 自动清理已归档/删除、或因新活动而唤醒的软收起记录，防止 localStorage 堆积或日后意外回落；列表加载完才清
   useEffect(() => {
-    const drop: string[] = [];
-    for (const [id, at] of Object.entries(settled)) {
-      const thread = threadsById.get(id);
-      if (!thread) {
-        if (allThreads.length > 0) drop.push(id);
-        continue;
-      }
-      if (!isThreadSettled(thread, at, draftIds.has(id))) drop.push(id);
-    }
+    const drop = settledToPrune(settled, (id) => threadsById.get(id), draftIds, threadsStatus === "ready");
     if (drop.length > 0) prune(drop);
-  }, [settled, threadsById, allThreads.length, draftIds, prune]);
+  }, [settled, threadsById, threadsStatus, draftIds, prune]);
 
   // 按侧边栏视觉顺序收集“需要你”的对话（黄草稿 / 蓝等你或出错 / 绿完成未读），供 ] / [ 快捷键与顶栏徽标跳转
   const { attentionIds, topAttentionColor } = useMemo(() => {

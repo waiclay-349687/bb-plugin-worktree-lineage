@@ -1,12 +1,13 @@
 /**
  * [INPUT]: 依赖 @get-bb/plugin-sdk 的 defineRpcContract 与 zod
- * [OUTPUT]: 对外提供 hostContract（host 端契约: scanLineage 读 git、writeBriefing 按 route 调网关或本机 claude，失败可带冷却建议）、modelRouteSchema / ModelRoute（gateway | claude 两条通道）、serverContract（app↔server 契约: lineage、briefing、reportLanguage）及血缘数据类型
+ * [OUTPUT]: 对外提供 hostContract（host 端契约: scanLineage 读 git、writeBriefing 按 route 调网关或本机 claude，失败可带冷却建议）、modelRouteSchema / ModelRoute（gateway | claude 两条通道）、serverContract（app↔server 契约: lineage、briefing、settingsStatus / updateSettings / resetBriefingCooldowns（设置页）、reportLanguage）、settingsStatusSchema / SettingsStatus及血缘数据类型
  * [POS]: lib 的契约层; 消费者: host.ts、server.ts、briefings.ts、lib/model-run.ts、app.tsx、components/peek.tsx、lib/lineage.ts; 只定义数据形状，不含逻辑; serverContract.briefing 的输出另被 session-cockpit 插件跨插件读取，字段不可随意改
  * [PROTOCOL]: 变更时更新此头部,然后检查所在目录 CLAUDE.md
  */
 import { defineRpcContract } from "@get-bb/plugin-sdk";
 import { z } from "zod";
 import { storedBriefingSchema } from "./briefing";
+import { LANGUAGE_SETTINGS } from "./i18n";
 
 /**
  * 分支的起点从哪来，按可信度从高到低：
@@ -145,6 +146,33 @@ export const briefingViewSchema = z.object({
 });
 export type BriefingView = z.infer<typeof briefingViewSchema>;
 
+/** 设置页的插件状态快照 */
+export const settingsStatusSchema = z.object({
+  language: z.enum(LANGUAGE_SETTINGS),
+  /** 速览实际用的语言（auto 时是前端报上来的界面语言） */
+  briefingLanguage: z.enum(["en", "zh"]),
+  briefingEnabled: z.boolean(),
+  gateway: z.object({ baseUrl: z.string(), models: z.array(z.string()) }).nullable(),
+  claudeModel: z.string(),
+  briefing: z.object({
+    spentToday: z.number(),
+    dailyLimit: z.number(),
+    queued: z.number(),
+    working: z.boolean(),
+    /** model 为 null 表示整个网关连不上 */
+    cooldowns: z.array(z.object({ model: z.string().nullable(), until: z.number() })),
+    retryWaiting: z.number(),
+    pausedAt: z.number().nullable(),
+    last: z
+      .discriminatedUnion("status", [
+        z.object({ status: z.literal("ok"), via: z.enum(["gateway", "claude"]), model: z.string(), at: z.number() }),
+        z.object({ status: z.literal("failed"), at: z.number() }),
+      ])
+      .nullable(),
+  }),
+});
+export type SettingsStatus = z.infer<typeof settingsStatusSchema>;
+
 export const serverContract = defineRpcContract({
   lineage: {
     input: z.object({ refresh: z.boolean().default(false) }),
@@ -160,6 +188,21 @@ export const serverContract = defineRpcContract({
   briefing: {
     input: z.object({ threadId: z.string().min(1) }),
     output: briefingViewSchema,
+  },
+  /** 设置页读一次插件状态：两项可在设置页直接改的设置 + 速览的运行状态（只读，不触发生成） */
+  settingsStatus: {
+    input: z.object({}),
+    output: settingsStatusSchema,
+  },
+  /** 设置页改设置：写进 bb.settings（与声明式设置、bb plugin config 同一份），返回最新状态 */
+  updateSettings: {
+    input: z.object({ language: z.enum(LANGUAGE_SETTINGS).optional(), briefingEnabled: z.boolean().optional() }),
+    output: settingsStatusSchema,
+  },
+  /** 设置页手动恢复：清网关冷却与失败重试的冷却，然后补写一遍；返回最新状态 */
+  resetBriefingCooldowns: {
+    input: z.object({}),
+    output: settingsStatusSchema,
   },
   /** 前端报告它解析出的界面语言（设置为 auto 时由浏览器语言决定）；服务端据此决定 auto 模式下速览用哪种语言 */
   reportLanguage: {

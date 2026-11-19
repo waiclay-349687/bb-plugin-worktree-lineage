@@ -1,6 +1,6 @@
 /**
  * [INPUT]: 依赖 bb.sdk.threads（对话大纲、列表）与 bb.sdk.environments（对话在哪台机器）、bb.events 的 thread.idle / thread.deleted、bb.storage.kv 存盘、bb.log 记录命中的通道与跳过 / 失败的网关模型、调用方注入的 callModel（经 host.ts 的 writeBriefing 调网关或本机 claude）; 依赖 lib/briefing 的提要与解析
- * [OUTPUT]: 对外提供 createBriefingService(bb, callModel, getSettings): { view(threadId), backfill() } — 在后台为每条对话写“全程速览”并存盘；view 给界面一次性取回速览、是否落后、兜底摘要（只读）; generateBriefing(callModel, hostId, request, settings, cooldowns, now): 按顺序试网关模型链（按 settings.language 校验输出）（跳过冷却中的）、全不行再兜底本机 claude 的一次生成（不依赖 bb，可单测）; parseModelList: 逗号分隔的有序模型列表; CooldownTable / GatewayStep 类型
+ * [OUTPUT]: 对外提供 createBriefingService(bb, callModel, getSettings): { view(threadId), backfill(), status()（设置页的运行状态快照）, resetCooldowns()（清冷却后补写） } — 在后台为每条对话写“全程速览”并存盘；view 给界面一次性取回速览、是否落后、兜底摘要（只读）; generateBriefing(callModel, hostId, request, settings, cooldowns, now): 按顺序试网关模型链（按 settings.language 校验输出）（跳过冷却中的）、全不行再兜底本机 claude 的一次生成（不依赖 bb，可单测）; parseModelList: 逗号分隔的有序模型列表; summarizeCooldowns: 冷却表 → 设置页清单; BriefingStatus 类型; CooldownTable / GatewayStep 类型
  * [POS]: 插件服务端的速览调度; 消费者: server.ts; 与 lib/briefing.ts 的边界: 这里决定“何时写、写哪条、用哪种语言写、按什么顺序走哪条通道、哪个网关模型在冷却、写完存哪”（语言和当前界面不一致的存盘速览既不显示、也算落后要重写），提示词与输出校验在 briefing; 与 host.ts 的边界: 这里不执行任何命令，回退决策在这里、执行在 host
  * [PROTOCOL]: 变更时更新此头部,然后检查项目根 CLAUDE.md
  */
@@ -121,6 +121,35 @@ export async function generateBriefing(
   return { status: "failed", steps, message: hit.reason };
 }
 
+/**
+ * 冷却表 → 给设置页看的清单：按模型合并（同一模型在几台机器上冷却，取最晚的截止时间），model 为 null 表示整个网关连不上；
+ * 已过期的不列，按截止时间先后排。
+ */
+export function summarizeCooldowns(table: ReadonlyMap<string, number>, now: number): { model: string | null; until: number }[] {
+  const latest = new Map<string | null, number>();
+  for (const [key, until] of table) {
+    if (until <= now) continue;
+    const raw = key.slice(key.lastIndexOf("|") + 1);
+    const model = raw === "*" ? null : raw;
+    latest.set(model, Math.max(latest.get(model) ?? 0, until));
+  }
+  return [...latest].map(([model, until]) => ({ model, until })).sort((a, b) => a.until - b.until);
+}
+
+/** 设置页上的速览运行状态（只读快照） */
+export interface BriefingStatus {
+  spentToday: number;
+  dailyLimit: number;
+  queued: number;
+  working: boolean;
+  cooldowns: { model: string | null; until: number }[];
+  /** 生成失败后在重试冷却里的对话数 */
+  retryWaiting: number;
+  /** 连续失败太多次清空了队列的时间；之后又写成过一条就清掉 */
+  pausedAt: number | null;
+  last: { status: "ok"; via: ModelRoute["via"]; model: string; at: number } | { status: "failed"; at: number } | null;
+}
+
 /** 日志里的时长：不足一分钟写秒，否则写分钟 */
 const span = (ms: number) => (ms < 60_000 ? `${Math.ceil(ms / 1000)}s` : `${Math.ceil(ms / 60_000)}m`);
 
@@ -155,6 +184,8 @@ export function createBriefingService(bb: BbPluginApi, callModel: CallModel, get
   const failed = new Map<string, { key: string; at: number }>();
   const cooldowns: CooldownTable = new Map();
   let consecutiveFailures = 0;
+  let pausedAt: number | null = null;
+  let last: BriefingStatus["last"] = null;
 
   async function read(threadId: string): Promise<StoredBriefing | null> {
     const parsed = storedBriefingSchema.safeParse(await bb.storage.kv.get(KEY(threadId)));
@@ -237,11 +268,14 @@ export function createBriefingService(bb: BbPluginApi, callModel: CallModel, get
     if (outcome.status === "failed") {
       failed.set(threadId, { key, at: Date.now() });
       consecutiveFailures += 1;
+      last = { status: "failed", at: Date.now() };
       bb.log.warn(`briefing failed for ${threadId} (claude ${settings.model}): ${outcome.message}${skippedNote}`);
       return;
     }
     failed.delete(threadId);
     consecutiveFailures = 0;
+    pausedAt = null;
+    last = { status: "ok", via: outcome.via, model: outcome.model, at: Date.now() };
     await bb.storage.kv.set(KEY(threadId), { ...outcome.briefing, version: BRIEFING_VERSION, language: settings.language, outlineKey: key, askCount, generatedAt: Date.now() } satisfies StoredBriefing);
     const cost = outcome.costUsd === null ? "" : `, $${outcome.costUsd}`;
     const fallback = outcome.steps.length > 0 ? " (fallback)" : "";
@@ -259,6 +293,7 @@ export function createBriefingService(bb: BbPluginApi, callModel: CallModel, get
           bb.log.warn(`briefing: ${consecutiveFailures} failures in a row, dropping ${queue.length} queued threads`);
           queue.length = 0;
           consecutiveFailures = 0;
+          pausedAt = Date.now();
         }
       }
     } finally {
@@ -293,5 +328,29 @@ export function createBriefingService(bb: BbPluginApi, callModel: CallModel, get
     queue.length = 0;
   });
 
-  return { view, backfill };
+  /** 设置页用的运行状态快照（只读，不触发任何生成） */
+  async function status(): Promise<BriefingStatus> {
+    const record = await bb.storage.kv.get<{ day: string; count: number }>(SPEND_KEY);
+    return {
+      spentToday: record?.day === today() ? record.count : 0,
+      dailyLimit: DAILY_LIMIT,
+      queued: queue.length,
+      working,
+      cooldowns: summarizeCooldowns(cooldowns, Date.now()),
+      retryWaiting: failed.size,
+      pausedAt,
+      last,
+    };
+  }
+
+  /** 用户在设置页手动恢复：清掉网关冷却与失败重试的冷却，再补写一遍（补写本身有条数与每天上限） */
+  async function resetCooldowns(): Promise<void> {
+    cooldowns.clear();
+    failed.clear();
+    consecutiveFailures = 0;
+    pausedAt = null;
+    await backfill();
+  }
+
+  return { view, backfill, status, resetCooldowns };
 }

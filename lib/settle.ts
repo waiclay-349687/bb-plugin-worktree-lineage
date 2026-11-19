@@ -1,11 +1,30 @@
 /**
  * [INPUT]: 依赖 lib/conversations 的 Conversation / activityOf、lib/view 的 rowColor / rowTone
- * [OUTPUT]: 对外提供 isThreadSettled / isConversationSettled / splitSettledConversations（Settle 软收起判定与智能唤醒）、needsUserAttention、orderByVisual（按屏幕上的实际行序重排待办）、nextAttentionId（循环定位下一个需要处理的对话）
- * [POS]: lib 的本地软收起与快捷跳转纯逻辑; 消费者: components/lineage-list.tsx; 与 bb 归档的边界: 软收起只存插件本地状态，绝不触发 bb 归档，也不触碰磁盘工作区或环境
+ * [OUTPUT]: 对外提供 SETTLED_STORAGE_KEY / SETTLED_CHANGED_EVENT / parseSettledMap（本机 Settle 记录的存储约定） 、settledToPrune（列表加载完才清理过期记录）、isThreadSettled / isConversationSettled / splitSettledConversations（Settle 软收起判定与智能唤醒）、needsUserAttention、orderByVisual（按屏幕上的实际行序重排待办）、nextAttentionId（循环定位下一个需要处理的对话）
+ * [POS]: lib 的本地软收起与快捷跳转纯逻辑; 消费者: components/lineage-list.tsx、components/settings-section.tsx（显示数量、全部移回）; 与 bb 归档的边界: 软收起只存插件本地状态，绝不触发 bb 归档，也不触碰磁盘工作区或环境
  * [PROTOCOL]: 变更时更新此头部,然后检查所在目录 CLAUDE.md
  */
 import { activityOf, type Conversation, type ConversationLike } from "./conversations";
 import { rowColor, rowTone } from "./view";
+
+/** 本机浏览器里存 Settle 记录的键（threadId → 收起时间）；只在本机，不进 bb */
+export const SETTLED_STORAGE_KEY = "worktree-lineage.settled";
+/** 同一页面里有人改了 Settle 记录（例如设置页“全部移回”）时派发，列表据此重读 */
+export const SETTLED_CHANGED_EVENT = "worktree-lineage:settled-changed";
+
+/** 解析本地存储里的 Settle 记录：坏数据、非数字的时间一律丢掉，永不抛出 */
+export function parseSettledMap(raw: string | null): Record<string, number> {
+  if (!raw) return {};
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return {};
+    const clean: Record<string, number> = {};
+    for (const [id, at] of Object.entries(parsed)) if (typeof at === "number" && Number.isFinite(at)) clean[id] = at;
+    return clean;
+  } catch {
+    return {};
+  }
+}
 
 export interface SettleCheckable extends ConversationLike {
   indicator: string;
@@ -28,6 +47,26 @@ export function isThreadSettled(
   const tone = rowTone(thread.indicator, hasDraft);
   if (tone === "running" || tone === "attention" || tone === "error" || tone === "draft") return false;
   return activityOf(thread, false) <= settledAt;
+}
+
+/**
+ * 哪些 Settle 记录该清掉：对话已归档 / 删除（列表里找不到），或者已经被新活动唤醒。
+ * 列表还没加载完（listReady 为 false）时一条都不清：加载中的列表只是一部分，按“找不到”去清会把真实的记录删掉
+ * （实测：手机上刷新后 300ms 内列表还是空的，记录就被清空了）。
+ */
+export function settledToPrune(
+  settled: Readonly<Record<string, number>>,
+  lookup: (id: string) => SettleCheckable | undefined,
+  draftIds: ReadonlySet<string>,
+  listReady: boolean,
+): string[] {
+  if (!listReady) return [];
+  return Object.entries(settled)
+    .filter(([id, at]) => {
+      const thread = lookup(id);
+      return !thread || !isThreadSettled(thread, at, draftIds.has(id));
+    })
+    .map(([id]) => id);
 }
 
 /** 一家人（父对话及其派出的所有子对话）是否全部处于可软收起状态 */
