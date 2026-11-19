@@ -1,10 +1,9 @@
 /**
- * [INPUT]: 依赖 @get-bb/plugin-sdk/app 的侧边栏线程数据、provider 图标、线程快捷操作与菜单、状态组件、导航; 依赖 server.ts 的 lineage RPC; 依赖 lib/tree 建树、lib/conversations（对话视图）与 lib/view（分支树视图）两个展示模型; 依赖 components/motion 的存在感列表与全局 FLIP 滑移; 依赖 components/i18n 的 LanguageProvider / useT / useLang（全部界面文案按界面语言从词典取）; 依赖 lib/settle 的本机搁置存储约定（设置页“全部取消搁置”后经 SETTLED_CHANGED_EVENT 重读，列表加载完才清理过期记录）; 依赖 lib/row-menu 的菜单项组装与搁置可见规则、@radix-ui/react-dropdown-menu（手机分支行菜单）、bb 的 experimental_ThreadActionsMenu（手机对话行菜单，插件项经 inline 并入）
+ * [INPUT]: 依赖 @get-bb/plugin-sdk/app 的侧边栏线程数据、provider 图标、线程快捷操作与菜单、状态组件、导航; 依赖 server.ts 的 lineage RPC; 依赖 lib/tree 建树、lib/conversations（对话视图）与 lib/view（分支树视图）两个展示模型; 依赖 components/motion 的存在感列表与全局 FLIP 滑移; 依赖 components/i18n 的 LanguageProvider / useT / useLang（全部界面文案按界面语言从词典取）; 依赖 lib/settle 的本机搁置存储约定（设置页“全部取消搁置”后经 SETTLED_CHANGED_EVENT 重读，列表加载完才清理过期记录）; 依赖 lib/row-menu 的搁置可见规则与插件菜单项（经 inline 并入 bb 的长按 / 右键菜单与桌面“更多”菜单）
  * [OUTPUT]: 对外提供 LineageList: experimental_threadList 槽位的列表组件
  * [POS]: 插件界面主体; 消费者: app.tsx; 与 lib 的边界: 谁挂在谁下面、怎么排序由 lib/conversations（对话视图：对话是主角，不出现分支）与 lib/view（分支树视图：分支是主行，对话是次级行）决定，这里只负责渲染与交互（折叠、视图切换、悬停快捷操作、轮询、入场/退场/重排/置顶动效）; 视觉全部在 styles.css，颜色只用宿主主题变量
  * [PROTOCOL]: 变更时更新此头部,然后检查所在目录 CLAUDE.md
  */
-import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
 import { createContext, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react";
 import {
   ThreadTitle,
@@ -24,10 +23,9 @@ import {
   useSidebarThreadDraftIds,
   useSidebarThreadRowStatus,
   type PluginSidebarThread,
+  type PluginThreadActionsInlineItem,
 } from "@get-bb/plugin-sdk/app";
 import { Glyph } from "@/components/icons";
-
-declare const __BB_PLUGIN_ID__: string | undefined;
 import { MotionRow, reducedMotion, useFlipContainer, usePresenceList } from "@/components/motion";
 import { Peek, type PeekTarget } from "@/components/peek";
 import { Icon } from "@/components/ui/icon";
@@ -38,7 +36,7 @@ import { branchLabel, buildLineageTree, collectAncestry, walkThreads, type Branc
 import { matchThreads } from "@/lib/search";
 import { isThreadSettled, needsUserAttention, nextAttentionId, orderByVisual, parseSettledMap, SETTLED_CHANGED_EVENT, SETTLED_STORAGE_KEY, settledToPrune, splitSettledConversations } from "@/lib/settle";
 import type { Messages } from "@/lib/i18n";
-import { branchMenuItems, settleMode, threadMenuItems, type MenuItemSpec } from "@/lib/row-menu";
+import { settleMode, threadMenuItems } from "@/lib/row-menu";
 import { LanguageProvider, useLang, useT } from "@/components/i18n";
 import { buildProjectView, pathLabels, relativeTime, rollupTone, rowColor, rowTone, toneOf, worktreeCleanupCommand, type RowColor, type ViewNode } from "@/lib/view";
 
@@ -1220,17 +1218,8 @@ function BranchItem({
           {leaf}
         </span>
         {tags.length > 0 ? <span className="wl-btags">{tags.join(" · ")}</span> : null}
-        {!list.compact && cleanupCmd && !exiting ? <CopyCleanupButton command={cleanupCmd} /> : null}
-        {!list.compact && startHere && !exiting ? <StartHereButton {...startHere} reveal /> : null}
-        {list.compact && !exiting ? (
-          <CompactBranchMenu
-            items={branchMenuItems({ startHere: Boolean(startHere), cleanupCommand: cleanupCmd }, tx)}
-            onPick={(key) => {
-              if (key === "start-here") startHere?.run();
-              else if (key === "copy-cleanup" && cleanupCmd) void copyToClipboard({ text: cleanupCmd });
-            }}
-          />
-        ) : null}
+        {cleanupCmd && !exiting ? <CopyCleanupButton command={cleanupCmd} /> : null}
+        {startHere && !exiting ? <StartHereButton {...startHere} reveal /> : null}
         {hasKids && !exiting ? <FoldButton open={open} hidden={hidden} toggle={() => list.toggle(key)} /> : null}
       </div>
       {threadPresence.entries.length > 0 ? (
@@ -1544,10 +1533,12 @@ function QuickActions({
   thread,
   startHere,
   settleAction,
+  inline,
 }: {
   thread: Thread;
   startHere?: { run: () => void; known: boolean };
   settleAction?: { mode: "settle" | "unsettle"; run: () => void };
+  inline: PluginThreadActionsInlineItem[];
 }) {
   const tx = useT();
   const target = actionTarget(thread);
@@ -1583,6 +1574,7 @@ function QuickActions({
         ))}
       <ThreadActionsMenu
         thread={target}
+        inline={inline}
         side="right"
         align="start"
         sideOffset={8}
@@ -1596,28 +1588,13 @@ function QuickActions({
   );
 }
 
-/** 菜单触发按钮自己吃掉点击：绝不让它冒泡到行上去打开对话 */
-function stopRowNavigation(event: { stopPropagation(): void; preventDefault(): void }, prevent: boolean) {
-  event.stopPropagation();
-  if (prevent) event.preventDefault();
-}
-
-/**
- * 手机上的对话行菜单：直接用 bb 的线程菜单（紧凑宽度下是抽屉），宿主自己的全部操作（置顶、标记未读、重命名、
- * 重新生成标题、归档…）都在里面；插件的 Settle / Unsettle 与“在此新建”作为 inline 项并进同一张菜单，不套第二层。
- */
-function CompactThreadMenu({
-  thread,
-  startHere,
-  settleAction,
-}: {
-  thread: Thread;
-  startHere?: { run: () => void; known: boolean };
-  settleAction?: { mode: "settle" | "unsettle"; run: () => void };
-}) {
-  const tx = useT();
-  const specs = threadMenuItems({ settle: settleAction?.mode ?? null, startHere: Boolean(startHere) }, tx);
-  const inline = specs.map((spec) => ({
+/** 插件追加进 bb 线程菜单的项（长按 / 右键菜单与桌面“更多”菜单共用同一份） */
+function threadInline(
+  tx: Messages,
+  startHere: { run: () => void; known: boolean } | undefined,
+  settleAction: { mode: "settle" | "unsettle"; run: () => void } | undefined,
+): PluginThreadActionsInlineItem[] {
+  return threadMenuItems({ settle: settleAction?.mode ?? null, startHere: Boolean(startHere) }, tx).map((spec) => ({
     key: spec.key,
     group: spec.group,
     action: {
@@ -1627,82 +1604,6 @@ function CompactThreadMenu({
       run: () => (spec.key === "worktree-lineage/start-here" ? startHere?.run() : settleAction?.run()),
     },
   }));
-  return (
-    <ThreadActionsMenu
-      thread={actionTarget(thread)}
-      inline={inline}
-      side="bottom"
-      align="end"
-      sideOffset={6}
-      trigger={(triggerProps) => (
-        <button
-          {...triggerProps}
-          type="button"
-          className="wl-btn wl-row-menu"
-          aria-label={tx.threadMenu}
-          title={tx.threadMenu}
-          onPointerDown={(event) => {
-            triggerProps.onPointerDown?.(event);
-            stopRowNavigation(event, false);
-          }}
-          onClick={(event) => {
-            triggerProps.onClick?.(event);
-            stopRowNavigation(event, true);
-          }}
-        >
-          <Glyph name="more" size={14} />
-        </button>
-      )}
-    />
-  );
-}
-
-/**
- * 手机上的分支行菜单：在此新建对话、复制安全清理命令（命令原样显示在第二行）。
- * 分支没有 bb 的线程菜单，用 Radix 下拉菜单；内容渲染到 body，带上插件根标记（宿主据此认出是插件的浮层，
- * 在里面点不会被当成“点了侧边栏外面”而收起侧边栏）。
- */
-function CompactBranchMenu({ items, onPick }: { items: MenuItemSpec[]; onPick: (key: string) => void }) {
-  const tx = useT();
-  const pluginId = typeof __BB_PLUGIN_ID__ === "string" ? __BB_PLUGIN_ID__ : "worktree-lineage";
-  if (items.length === 0) return null;
-  return (
-    <DropdownMenu.Root modal={false}>
-      <DropdownMenu.Trigger asChild>
-        <button
-          type="button"
-          className="wl-btn wl-row-menu"
-          aria-label={tx.branchMenu}
-          title={tx.branchMenu}
-          onClick={(event) => stopRowNavigation(event, true)}
-        >
-          <Glyph name="more" size={14} />
-        </button>
-      </DropdownMenu.Trigger>
-      <DropdownMenu.Portal>
-        <DropdownMenu.Content
-          className="wl-menu"
-          side="bottom"
-          align="end"
-          sideOffset={6}
-          collisionPadding={8}
-          data-bb-portaled-overlay=""
-          data-bb-plugin-root=""
-          data-bb-plugin={pluginId}
-        >
-          {items.map((item) => (
-            <DropdownMenu.Item key={item.key} className="wl-menu-item" onSelect={() => onPick(item.key)}>
-              <Icon name={item.icon} className="size-4" />
-              <span className="wl-menu-text">
-                <span className="wl-menu-label">{item.label}</span>
-                {item.detail ? <span className="wl-menu-detail">{item.detail}</span> : null}
-              </span>
-            </DropdownMenu.Item>
-          ))}
-        </DropdownMenu.Content>
-      </DropdownMenu.Portal>
-    </DropdownMenu.Root>
-  );
 }
 
 /**
@@ -1786,6 +1687,7 @@ function ThreadCell({
   // 只有空闲或完成未读（且未置顶）的对话才展示 Settle 按钮；Settled 架子里的对话始终展示 Unsettle
   const visibleSettle = settleMode(settleAction?.mode, tone, Boolean(thread.isPinned));
   const effectiveSettle = settleAction && visibleSettle ? { mode: visibleSettle, run: settleAction.run } : undefined;
+  const inline = threadInline(tx, startHere, effectiveSettle);
 
   return (
     <MotionRow
@@ -1795,7 +1697,8 @@ function ThreadCell({
       onExited={onExited}
       onSettled={list.syncPositions}
     >
-      <ThreadActionsContextMenu thread={actionTarget(thread)}>
+      {/* 右键（桌面）/ 长按（手机）打开 bb 的线程菜单；插件的搁置与“在此新建”作为 inline 项并进去 */}
+      <ThreadActionsContextMenu thread={actionTarget(thread)} inline={inline}>
         <div
           className={arrive ? "wl-cell wl-arrive" : "wl-cell"}
           data-tone={tone ?? undefined}
@@ -1883,9 +1786,7 @@ function ThreadCell({
             ) : null}
             <span className="wl-tail">
               <span className="wl-slot">{showGlyph ? <ThreadStatusGlyph indicator={indicator} rowStatus={rowStatus} size="compact" /> : time}</span>
-              {hot && !list.compact && !exiting ? <QuickActions thread={thread} startHere={startHere} settleAction={effectiveSettle} /> : null}
-              {/* 手机（紧凑 / 触屏）没有悬停：行尾常驻一个 ⋯，桌面悬停能做的事全在里面 */}
-              {list.compact && !exiting ? <CompactThreadMenu thread={thread} startHere={startHere} settleAction={effectiveSettle} /> : null}
+              {hot && !list.compact && !exiting ? <QuickActions thread={thread} startHere={startHere} settleAction={effectiveSettle} inline={inline} /> : null}
             </span>
           </div>
           {sub !== undefined ? <div className="wl-line2">{sub}</div> : null}
