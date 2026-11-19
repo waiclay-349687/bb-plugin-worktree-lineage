@@ -1,0 +1,1173 @@
+/**
+ * [INPUT]: 依赖 @get-bb/plugin-sdk/app 的侧边栏线程数据、provider 图标、线程快捷操作与菜单、状态组件、导航; 依赖 server.ts 的 lineage RPC; 依赖 lib/tree 建树、lib/conversations（对话视图）与 lib/view（分支树视图）两个展示模型
+ * [OUTPUT]: 对外提供 LineageList: experimental_threadList 槽位的列表组件
+ * [POS]: 插件界面主体; 消费者: app.tsx; 与 lib 的边界: 谁挂在谁下面、怎么排序由 lib/conversations（对话视图：对话是主角，不出现分支）与 lib/view（分支树视图：分支是主行，对话是次级行）决定，这里只负责渲染与交互（折叠、视图切换、悬停快捷操作、轮询）; 视觉全部在 styles.css，颜色只用宿主主题变量
+ * [PROTOCOL]: 变更时更新此头部,然后检查所在目录 CLAUDE.md
+ */
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react";
+import {
+  ThreadTitle,
+  experimental_ProviderIcon as ProviderIcon,
+  experimental_ThreadActionsContextMenu as ThreadActionsContextMenu,
+  experimental_ThreadActionsMenu as ThreadActionsMenu,
+  experimental_ThreadStatusGlyph as ThreadStatusGlyph,
+  experimental_copyToClipboard as copyToClipboard,
+  experimental_useProviders as useProviders,
+  experimental_useRpcQuery as useRpcQuery,
+  experimental_useSidebarThreadSplit as useSidebarThreadSplit,
+  experimental_useSidebarThreads as useSidebarThreads,
+  experimental_useThreadActions as useThreadActions,
+  useBbNavigate,
+  useSdk,
+  useSidebarThreadDraft,
+  useSidebarThreadDraftIds,
+  useSidebarThreadRowStatus,
+  type PluginSidebarThread,
+} from "@get-bb/plugin-sdk/app";
+import { Glyph } from "@/components/icons";
+import { Peek, type PeekTarget } from "@/components/peek";
+import { Icon } from "@/components/ui/icon";
+import { serverContract, type ProjectLineage } from "@/lib/contract";
+import { activityOf, buildConversations, countDescendants, type Conversation } from "@/lib/conversations";
+import { branchLabel, buildLineageTree, collectAncestry, walkThreads, type BranchView } from "@/lib/tree";
+import { matchThreads } from "@/lib/search";
+import { buildProjectView, pathLabels, relativeTime, rollupTone, rowColor, rowTone, toneOf, type ViewNode } from "@/lib/view";
+
+type Thread = PluginSidebarThread;
+/** family: 默认，一个 worktree 一张卡片、按谁派的缩进；lineage: 分支树 */
+type ViewMode = "family" | "lineage";
+type Provider = ReturnType<typeof useProviders>["providers"][number];
+
+interface PluginThreadListProps {
+  activeThreadId: string | null;
+  activeProjectId: string | null;
+  isCompactViewport: boolean;
+  onNavigate: () => void;
+}
+
+const POLL_MS = 45_000;
+const STORAGE_VIEW = "worktree-lineage.mode";
+const STORAGE_COLLAPSED = "worktree-lineage.collapsed";
+/** 输入停顿多久才去问 bb 的官方搜索（它搜消息内容，要走服务器） */
+const SEARCH_DEBOUNCE_MS = 260;
+const SEARCH_LIMIT = 8;
+/** 鼠标停多久才出预览卡 */
+const PEEK_DELAY_MS = 550;
+/** 鼠标离开整个列表（或离开卡片）后多久收起：要够从行上横着移到卡片上（中间有一道缝） */
+const PEEK_GRACE_MS = 300;
+/** 鼠标离开一行、但还在列表里（经过分组标题或空隙）时多久收起：这段时间里落到另一条对话上，卡片直接滑过去 */
+const PEEK_LINGER_MS = 900;
+/** 卡片刚收起不久又停到一行上：不用再等，直接出（连着看几条时不必每次都等半秒） */
+const PEEK_REOPEN_MS = 700;
+/** 悬停时行尾的快捷按钮，和 bb 自带列表的默认设置一致；其余操作在“更多”与右键菜单里 */
+const QUICK_ACTIONS = ["bb--core/regenerateTitle", "bb--core/archive"] as const;
+const SOURCE_LABEL = {
+  recorded: "bb 记录",
+  reflog: "git 创建记录",
+  "reflog-commit": "git 创建记录（按提交反查）",
+  unknown: "未知",
+} as const;
+
+const normalizePath = (p: string) => p.replace(/\/+$/, "");
+
+/** 折叠状态：只记用户动过的节点，其余走默认 */
+function usePersistentMap(key: string) {
+  const [map, setMap] = useState<Record<string, boolean>>(() => {
+    try {
+      return JSON.parse(localStorage.getItem(key) ?? "{}") as Record<string, boolean>;
+    } catch {
+      return {};
+    }
+  });
+  const set = useCallback(
+    (id: string, value: boolean) =>
+      setMap((prev) => {
+        const next = { ...prev, [id]: value };
+        localStorage.setItem(key, JSON.stringify(next));
+        return next;
+      }),
+    [key],
+  );
+  return [map, set] as const;
+}
+
+interface ListContext {
+  activeThreadId: string | null;
+  onNavigate: () => void;
+  compact: boolean;
+  view: ViewMode;
+  now: number;
+  /** 首屏画完之后才为 true：之后挂载的行（新来的、展开出来的、切换排列的）淡入一次，首屏不闪 */
+  ready: boolean;
+  threadsById: Map<string, Thread>;
+  providersById: Map<string, Provider>;
+  childCount: Map<string, number>;
+  focusId: string | null;
+  focusSet: Set<string> | null;
+  setFocus: (id: string | null) => void;
+  isOpen: (key: string, fallback?: boolean) => boolean;
+  toggle: (key: string, fallback?: boolean) => void;
+  /** 悬停预览卡：鼠标停在一行上一小会儿后显示；移开、滚动、按键时收起 */
+  peekSchedule: (thread: Thread, row: HTMLElement) => void;
+  peekCancel: () => void;
+  /** 快速筛选结果里用方向键选中的那一行 */
+  selectedId: string | null;
+}
+const Ctx = createContext<ListContext | null>(null);
+
+/** 嵌套层数写成 CSS 变量：行的缩进、连线的横向位置都由它算出来（规则：下一级的图标对齐上一级文字的左缘） */
+const depthStyle = (depth: number) => ({ "--wl-depth": depth }) as CSSProperties;
+const useList = () => useContext(Ctx)!;
+
+/** 来路上已经画出的对话：上级就在来路上时不再标注“派自” */
+
+export function LineageList(props: PluginThreadListProps) {
+  const { threads: allThreads, projects } = useSidebarThreads();
+  const { providers } = useProviders();
+  const navigate = useBbNavigate();
+  const [view, setView] = useState<ViewMode>(() => (localStorage.getItem(STORAGE_VIEW) === "lineage" ? "lineage" : "family"));
+  const [collapsed, setCollapsed] = usePersistentMap(STORAGE_COLLAPSED);
+  const [focusId, setFocus] = useState<string | null>(null);
+
+  const query = useRpcQuery({ contract: serverContract, method: "lineage", input: { refresh: false } });
+  // 只在页面可见时轮询；切回可见或窗口重新聚焦时立刻补一次
+  const refetchRef = useRef(query.refetch);
+  refetchRef.current = query.refetch;
+  useEffect(() => {
+    const refetch = () => void refetchRef.current();
+    const timer = setInterval(() => !document.hidden && refetch(), POLL_MS);
+    const onVisibility = () => !document.hidden && refetch();
+    window.addEventListener("focus", refetch);
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => {
+      clearInterval(timer);
+      window.removeEventListener("focus", refetch);
+      document.removeEventListener("visibilitychange", onVisibility);
+    };
+  }, []);
+
+  const threads = useMemo(() => allThreads.filter((t) => !t.isHidden && !t.isArchived), [allThreads]);
+  const threadsById = useMemo(() => new Map(threads.map((t) => [t.id, t])), [threads]);
+  const providersById = useMemo(() => new Map(providers.map((p) => [p.id, p])), [providers]);
+  const childCount = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const t of threads) if (t.parentThreadId) counts.set(t.parentThreadId, (counts.get(t.parentThreadId) ?? 0) + 1);
+    return counts;
+  }, [threads]);
+  const focusSet = useMemo(() => {
+    if (!focusId) return null;
+    const parentOf = new Map(threads.map((t) => [t.id, t.parentThreadId ?? null]));
+    const set = new Set<string>([focusId]);
+    for (const t of threads) if (collectAncestry(t.id, parentOf).has(focusId)) set.add(t.id);
+    return set;
+  }, [focusId, threads]);
+  const lineageByProject = useMemo(() => new Map((query.data?.projects ?? []).map((p) => [p.projectId, p])), [query.data]);
+  const pinned = useMemo(
+    () => threads.filter((t) => t.isPinned).sort((a, b) => (a.pinSortKey ?? "").localeCompare(b.pinSortKey ?? "")),
+    [threads],
+  );
+
+  // ── 快速筛选 ──
+  const [searching, setSearching] = useState(false);
+  const [text, setText] = useState("");
+  const [cursor, setCursor] = useState(0);
+  const inputRef = useRef<HTMLInputElement>(null);
+  const rootRef = useRef<HTMLDivElement>(null);
+  const projectNames = useMemo(() => new Map(projects.map((p) => [p.id, p.name])), [projects]);
+  const results = useMemo(() => matchThreads(threads, projectNames, text), [threads, projectNames, text]);
+  const filtering = searching && text.trim() !== "";
+  // bb 官方搜索：搜消息内容，也搜已归档的对话。输入停顿后再问，避免每个字都请求一次
+  const sdk = useSdk();
+  const [remote, setRemote] = useState<{ query: string; active: SearchHit[]; archived: SearchHit[] } | null>(null);
+  const [remoteBusy, setRemoteBusy] = useState(false);
+  useEffect(() => {
+    const queryText = text.trim();
+    if (!searching || queryText.length < 2) {
+      setRemote(null);
+      setRemoteBusy(false);
+      return;
+    }
+    setRemoteBusy(true);
+    const abort = new AbortController();
+    const timer = setTimeout(() => {
+      sdk.threads
+        .search({ query: queryText, limitPerGroup: String(SEARCH_LIMIT), signal: abort.signal })
+        .then((found) => {
+          if (abort.signal.aborted) return;
+          setRemote({ query: queryText, active: found.active.results.map(toHit), archived: found.archived.results.map(toHit) });
+          setRemoteBusy(false);
+        })
+        .catch(() => {
+          if (!abort.signal.aborted) setRemoteBusy(false);
+        });
+    }, SEARCH_DEBOUNCE_MS);
+    return () => {
+      clearTimeout(timer);
+      abort.abort();
+    };
+  }, [searching, text, sdk]);
+  // 三组候选：标题 / 分支命中的（本地，即时）→ 消息里提到的 → 已归档的；同一条对话只出现在最靠前的那组
+  const localIds = useMemo(() => new Set(results.map((t) => t.id)), [results]);
+  const mentioned = useMemo(() => (remote?.active ?? []).filter((hit) => !localIds.has(hit.id)), [remote, localIds]);
+  const archivedHits = remote?.archived ?? [];
+  const candidateIds = useMemo(
+    () => [...results.map((t) => t.id), ...mentioned.map((h) => h.id), ...archivedHits.map((h) => h.id)],
+    [results, mentioned, archivedHits],
+  );
+  const selectedId = filtering ? candidateIds[Math.min(cursor, candidateIds.length - 1)] ?? null : null;
+  const closeSearch = () => {
+    setSearching(false);
+    setText("");
+    setCursor(0);
+  };
+  // 在侧边栏之外的任何地方按 “/” 都能开始筛选；正在输入框或编辑器里打字时不抢
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key !== "/" || event.metaKey || event.ctrlKey || event.altKey) return;
+      const target = event.target as HTMLElement | null;
+      if (target && (target.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName))) return;
+      if (!rootRef.current || rootRef.current.offsetParent === null) return;
+      event.preventDefault();
+      setSearching(true);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
+  useEffect(() => {
+    if (searching) inputRef.current?.focus();
+  }, [searching]);
+
+  // ── 悬停预览卡 ──
+  const [peek, setPeek] = useState<{ threadId: string; top: number; left: number } | null>(null);
+  const peekTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const peekOpen = useRef(false);
+  peekOpen.current = peek !== null;
+  /** 立刻收起（滚动、按键、点击时） */
+  /** 鼠标是否在卡片上（卡片被收起时不会收到“离开”事件，所以收起的地方要顺手清掉） */
+  const peekOver = useRef(false);
+  const peekClose = useCallback(() => {
+    clearTimeout(peekTimer.current);
+    peekOver.current = false;
+    setPeek(null);
+  }, []);
+  const peekClosedAt = useRef(0);
+  /**
+   * 鼠标离开一行：先等一会儿再收。还在列表里（正经过分组标题、行与行之间的空隙）就多等一些，
+   * 让卡片留在原地，等鼠标落到下一条对话上再滑过去；离开了整个列表则很快收起。
+   */
+  const peekCancel = useCallback((delay: number = PEEK_LINGER_MS) => {
+    clearTimeout(peekTimer.current);
+    peekTimer.current = setTimeout(() => {
+      if (peekOpen.current) peekClosedAt.current = Date.now();
+      peekOver.current = false;
+      setPeek(null);
+    }, delay);
+  }, []);
+  const peekLeaveList = useCallback(() => peekCancel(PEEK_GRACE_MS), [peekCancel]);
+  /** 鼠标在卡片上：卡片留着（可以选字、复制），离开卡片再按“离开列表”处理 */
+  const peekHover = useMemo(
+    () => ({
+      onEnter: () => {
+        peekOver.current = true;
+        clearTimeout(peekTimer.current);
+      },
+      onLeave: () => {
+        peekOver.current = false;
+        peekCancel(PEEK_GRACE_MS);
+      },
+    }),
+    [peekCancel],
+  );
+  const peekSchedule = useCallback((thread: Thread, row: HTMLElement) => {
+    clearTimeout(peekTimer.current);
+    const show = () => {
+      const rect = row.getBoundingClientRect();
+      const side = rootRef.current?.getBoundingClientRect();
+      setPeek({ threadId: thread.id, top: rect.top, left: (side?.right ?? rect.right) + 14 });
+    };
+    // 卡片已经开着（或刚收起）：不关再开，直接移到这一行
+    if (peekOpen.current || Date.now() - peekClosedAt.current < PEEK_REOPEN_MS) show();
+    else peekTimer.current = setTimeout(show, PEEK_DELAY_MS);
+  }, []);
+  useEffect(() => {
+    // 只有“列表自己被滚动”才收起（行从鼠标下面移走了）。别处的滚动不算：
+    // 正在输出的对话会不停滚动聊天区，那不该把这边的卡片关掉
+    const onScroll = (event: Event) => {
+      const root = rootRef.current;
+      if (root && event.target instanceof Node && (event.target.contains(root) || root.contains(event.target))) peekClose();
+    };
+    // 鼠标在卡片上时，按键（复制的快捷键）和在卡片里的点击、拖选都不收起卡片；Esc 照常收起
+    const onKey = (event: KeyboardEvent) => {
+      if (!peekOver.current || event.key === "Escape") peekClose();
+    };
+    const onDown = (event: PointerEvent) => {
+      if (!(event.target instanceof Element && event.target.closest(".wl-peek"))) peekClose();
+    };
+    window.addEventListener("scroll", onScroll, true);
+    window.addEventListener("keydown", onKey, true);
+    window.addEventListener("pointerdown", onDown, true);
+    return () => {
+      clearTimeout(peekTimer.current);
+      window.removeEventListener("scroll", onScroll, true);
+      window.removeEventListener("keydown", onKey, true);
+      window.removeEventListener("pointerdown", onDown, true);
+    };
+  }, [peekClose]);
+  /**
+   * 预览卡里的分支信息和列表用同一个来源：git 里这个 worktree 现在检出的分支。
+   * bb 环境记录的分支名可能已经过时（agent 在 worktree 里切过分支），只在读不到 git 时才用它兜底。
+   */
+  const worktreeBranch = useMemo(() => {
+    const map = new Map<string, { branch: string | null; parent: string | null }>();
+    for (const project of query.data?.projects ?? []) {
+      if (project.result.status !== "ok") continue;
+      const parents = new Map(project.result.scan.branches.map((b) => [b.name, b.parent]));
+      for (const worktree of project.result.scan.worktrees) {
+        map.set(normalizePath(worktree.path), { branch: worktree.branch, parent: worktree.branch ? parents.get(worktree.branch) ?? null : null });
+      }
+    }
+    return map;
+  }, [query.data]);
+  const draftIds = useSidebarThreadDraftIds();
+  const peekThread = peek ? threadsById.get(peek.threadId) : undefined;
+  const peekTarget: PeekTarget | null =
+    peek && peekThread
+      ? {
+          thread: peekThread,
+          hasDraft: draftIds.has(peekThread.id),
+          top: peek.top,
+          left: peek.left,
+          projectName: peekThread.projectId ? projectNames.get(peekThread.projectId) ?? null : null,
+          provider: peekThread.providerId ? providersById.get(peekThread.providerId) : undefined,
+          ...(() => {
+            const info = peekThread.environment?.path ? worktreeBranch.get(normalizePath(peekThread.environment.path)) : undefined;
+            return { branch: info ? info.branch : peekThread.environment?.branchName ?? null, parentBranch: info?.parent ?? null, detached: info ? info.branch === null : false };
+          })(),
+          dispatchedBy: peekThread.parentThreadId ? threadsById.get(peekThread.parentThreadId)?.displayTitle ?? null : null,
+          children: threads.filter((t) => t.parentThreadId === peekThread.id).map((t) => toneOf(t.indicator)),
+          time: relativeTime(activityOf(peekThread, toneOf(peekThread.indicator) === "running"), Date.now()),
+        }
+      : null;
+
+  const [ready, setReady] = useState(false);
+  useEffect(() => {
+    const timer = setTimeout(() => setReady(true), 900);
+    return () => clearTimeout(timer);
+  }, []);
+
+  const ctx: ListContext = {
+    activeThreadId: props.activeThreadId,
+    onNavigate: props.onNavigate,
+    compact: props.isCompactViewport,
+    view,
+    now: Date.now(),
+    ready,
+    threadsById,
+    providersById,
+    childCount,
+    focusId,
+    focusSet,
+    setFocus,
+    isOpen: (key, fallback = true) => !(collapsed[key] ?? !fallback),
+    toggle: (key, fallback = true) => setCollapsed(key, !(collapsed[key] ?? !fallback)),
+    peekSchedule,
+    peekCancel,
+    selectedId,
+  };
+
+  const switchView = (next: ViewMode) => {
+    setView(next);
+    localStorage.setItem(STORAGE_VIEW, next);
+  };
+
+  return (
+    <Ctx.Provider value={ctx}>
+      <div
+        ref={rootRef}
+        className="wl-root"
+        data-view={view}
+        data-compact={props.isCompactViewport}
+        data-focus={focusSet !== null}
+        onPointerLeave={peekLeaveList}
+      >
+        <div className="wl-bar">
+          {searching ? (
+            <label className="wl-search wl-enter">
+              <Glyph name="search" size={12} />
+              <input
+                ref={inputRef}
+                value={text}
+                placeholder="筛选对话、分支、项目"
+                aria-label="筛选对话、分支、项目"
+                spellCheck={false}
+                onChange={(event) => {
+                  setText(event.target.value);
+                  setCursor(0);
+                }}
+                onBlur={() => {
+                  if (text.trim() === "") closeSearch();
+                }}
+                onKeyDown={(event) => {
+                  if (event.key === "Escape") {
+                    event.preventDefault();
+                    closeSearch();
+                  } else if (event.key === "ArrowDown") {
+                    event.preventDefault();
+                    setCursor((n) => Math.min(n + 1, Math.max(candidateIds.length - 1, 0)));
+                  } else if (event.key === "ArrowUp") {
+                    event.preventDefault();
+                    setCursor((n) => Math.max(n - 1, 0));
+                  } else if (event.key === "Enter" && selectedId) {
+                    event.preventDefault();
+                    navigate.toThread(selectedId);
+                    props.onNavigate();
+                    closeSearch();
+                  }
+                }}
+              />
+              <button type="button" className="wl-kbd" title="清除筛选" onMouseDown={(event) => event.preventDefault()} onClick={closeSearch}>
+                esc
+              </button>
+            </label>
+          ) : (
+            <>
+              <div className="wl-seg" role="group" aria-label="排列方式" data-view={view}>
+                <button type="button" aria-pressed={view === "family"} title="一个 worktree 一张卡片；被派出的对话缩进排在派它的对话下面" onClick={() => switchView("family")}>
+                  <Glyph name="dispatch" size={12} />
+                  对话
+                </button>
+                <button type="button" aria-pressed={view === "lineage"} title="按分支从哪切出来画成一棵树" onClick={() => switchView("lineage")}>
+                  <Glyph name="branch" size={12} />
+                  分支树
+                </button>
+              </div>
+              <span className="wl-grow" />
+              {focusId ? (
+                <button type="button" className="wl-clear" onClick={() => setFocus(null)}>
+                  取消高亮
+                </button>
+              ) : null}
+              <button type="button" className="wl-btn" aria-label="筛选" title="筛选对话、分支、项目（按 / ）" onClick={() => setSearching(true)}>
+                <Glyph name="search" />
+              </button>
+              <button
+                type="button"
+                className="wl-btn"
+                aria-label="重新读取 git"
+                title={query.isFetching ? "正在读取 git…" : "重新读取 git"}
+                onClick={() => void query.refetch()}
+              >
+                <Glyph name="refresh" className={query.isFetching ? "wl-spin" : undefined} />
+              </button>
+            </>
+          )}
+        </div>
+
+        {filtering ? (
+          <>
+            <ResultGroup title="标题或分支" count={results.length}>
+              {results.map((thread) => (
+                <ThreadCell
+                  key={thread.id}
+                  thread={thread}
+                  sub={
+                    <span className="wl-path">
+                      <span className="wl-path-leaf">{thread.projectId ? projectNames.get(thread.projectId) : null}</span>
+                      {thread.environment?.branchName ? <span className="wl-path-via">{branchLabel(thread.environment.branchName).leaf}</span> : null}
+                    </span>
+                  }
+                />
+              ))}
+            </ResultGroup>
+            <ResultGroup title="消息里提到" count={mentioned.length}>
+              {mentioned.map((hit) => {
+                const live = threadsById.get(hit.id);
+                return live ? (
+                  <ThreadCell key={hit.id} thread={live} sub={<Snippet hit={hit} />} />
+                ) : (
+                  <HitCell key={hit.id} hit={hit} />
+                );
+              })}
+            </ResultGroup>
+            <ResultGroup title="已归档" count={archivedHits.length}>
+              {archivedHits.map((hit) => (
+                <HitCell key={hit.id} hit={hit} quiet />
+              ))}
+            </ResultGroup>
+            {candidateIds.length === 0 ? (
+              <div className="wl-empty">{remoteBusy || (remote === null && text.trim().length >= 2) ? "正在搜索消息内容…" : "没有匹配的对话"}</div>
+            ) : remoteBusy ? (
+              <div className="wl-empty">正在搜索消息内容…</div>
+            ) : null}
+          </>
+        ) : null}
+
+        {!filtering && pinned.length > 0 ? (
+          <Section sectionKey="section:pinned" title="置顶" count={pinned.length}>
+            <ul className="wl-tree">
+              {pinned.map((t) => (
+                <ThreadCell key={t.id} thread={t} />
+              ))}
+            </ul>
+          </Section>
+        ) : null}
+
+        {(filtering ? [] : projects).map((project) => {
+          const projectThreads = threads.filter((t) => t.projectId === project.id && !t.isPinned);
+          const lineage = lineageByProject.get(project.id);
+          if (projectThreads.length === 0 && !lineage) return null;
+          return (
+            <ProjectSection
+              key={project.id}
+              projectId={project.id}
+              isPersonal={project.isPersonal}
+              name={project.name}
+              threads={projectThreads}
+              lineage={lineage}
+              loading={query.isLoading}
+            />
+          );
+        })}
+        {peekTarget && !props.isCompactViewport ? <Peek target={peekTarget} hover={peekHover} /> : null}
+      </div>
+    </Ctx.Provider>
+  );
+}
+
+/** bb 官方搜索的一条命中：一条对话 + 命中的那段文字 */
+interface SearchHit {
+  id: string;
+  title: string;
+  providerId: string | null;
+  projectId: string | null;
+  updatedAt: number;
+  /** 命中处前后的文字，分成三段：前 / 命中的词 / 后 */
+  before: string;
+  match: string;
+  after: string;
+}
+
+function toHit(result: {
+  thread: { id: string; title: string | null; titleFallback: string | null; providerId: string | null; projectId: string | null; updatedAt: number };
+  matches: { text: string; highlightRanges: { start: number; end: number }[] }[];
+}): SearchHit {
+  const { thread } = result;
+  const first = result.matches[0];
+  const range = first?.highlightRanges[0];
+  // 命中的文字是 markdown 原文：去掉强调、代码、标题这些符号，压成一行
+  const flat = (value: string) => value.replace(/[*`#>]+/g, "").replace(/\s+/g, " ");
+  // 命中的词前面只留一小段上下文，保证它落在第一行里
+  const before = first && range ? flat(first.text.slice(Math.max(0, range.start - 14), range.start)) : "";
+  return {
+    id: thread.id,
+    title: thread.title ?? thread.titleFallback ?? "（无标题）",
+    providerId: thread.providerId,
+    projectId: thread.projectId,
+    updatedAt: thread.updatedAt,
+    before: first && range && range.start > 14 ? `…${before}` : before,
+    match: first && range ? flat(first.text.slice(range.start, range.end)) : "",
+    after: first && range ? flat(first.text.slice(range.end, range.end + 60)) : first ? flat(first.text.slice(0, 70)) : "",
+  };
+}
+
+/** 命中处的那段文字，命中的词加重 */
+function Snippet({ hit }: { hit: SearchHit }) {
+  return (
+    <span className="wl-snippet">
+      {hit.before}
+      {hit.match ? <mark>{hit.match}</mark> : null}
+      {hit.after}
+    </span>
+  );
+}
+
+/** 一组候选；没有命中时整组不出现 */
+function ResultGroup({ title, count, children }: { title: string; count: number; children: ReactNode }) {
+  if (count === 0) return null;
+  return (
+    <section>
+      <div className="wl-section-head">
+        <span className="wl-section-name" style={{ paddingLeft: 4 }}>
+          {title}
+        </span>
+        <span className="wl-count" style={{ marginLeft: 6 }}>
+          {count}
+        </span>
+      </div>
+      <ul className="wl-flow">{children}</ul>
+    </section>
+  );
+}
+
+/** 不在侧边栏当前列表里的命中（主要是已归档的对话）：没有实时状态，只有标题、命中文字和时间 */
+function HitCell({ hit, quiet = false }: { hit: SearchHit; quiet?: boolean }) {
+  const list = useList();
+  const navigate = useBbNavigate();
+  const provider = hit.providerId ? list.providersById.get(hit.providerId) : undefined;
+  return (
+    <li>
+      <div className="wl-cell" data-lines={2} data-quiet={quiet} data-selected={list.selectedId === hit.id || undefined}>
+        <a
+          className="wl-cell-link"
+          href="#"
+          draggable={false}
+          aria-label={hit.title}
+          onClick={(event) => {
+            event.preventDefault();
+            navigate.toThread(hit.id);
+            list.onNavigate();
+          }}
+        />
+        <div className="wl-line1">
+          <span className="wl-logo" title={provider?.displayName}>
+            {provider ? <ProviderIcon providerKind="agent" provider={provider} className="size-3.5" aria-label={provider.displayName} /> : null}
+          </span>
+          <span className="wl-title">{hit.title}</span>
+        </div>
+        <div className="wl-line2">
+          <Snippet hit={hit} />
+          <span className="wl-grow" />
+          <span className="wl-time">{relativeTime(hit.updatedAt, list.now)}</span>
+        </div>
+      </div>
+    </li>
+  );
+}
+
+function Section({
+  sectionKey,
+  title,
+  count,
+  note,
+  action,
+  children,
+}: {
+  sectionKey: string;
+  title: string;
+  count?: number;
+  note?: string | null;
+  action?: ReactNode;
+  children: ReactNode;
+}) {
+  const list = useList();
+  const open = list.isOpen(sectionKey);
+  return (
+    <section>
+      <div className="wl-section-head">
+        <button type="button" className="wl-section-toggle" data-open={open} aria-expanded={open} onClick={() => list.toggle(sectionKey)}>
+          <span className="wl-section-name">{title}</span>
+          {count ? <span className="wl-count">{count}</span> : null}
+          {note ? <span className="wl-count">· {note}</span> : null}
+          <Glyph name="chevron" size={10} className="wl-chev" />
+        </button>
+        {action}
+      </div>
+      <Collapse open={open}>{children}</Collapse>
+    </section>
+  );
+}
+
+/** 项目级动作：在某个 worktree 里开新对话 */
+interface ProjectActions {
+  projectId: string;
+  defaultBranch: string | null;
+  canStartIn: (node: BranchView<Thread>) => boolean;
+  startIn: (node: BranchView<Thread>) => void;
+}
+
+function ProjectSection({
+  projectId,
+  isPersonal,
+  name,
+  threads,
+  lineage,
+  loading,
+}: {
+  projectId: string;
+  isPersonal: boolean;
+  name: string;
+  threads: Thread[];
+  lineage: ProjectLineage | undefined;
+  loading: boolean;
+}) {
+  const list = useList();
+  const navigate = useBbNavigate();
+  const scan = lineage?.result.status === "ok" ? lineage.result.scan : null;
+  const tree = useMemo(() => (scan ? buildLineageTree(threads, scan, lineage?.environments ?? []) : null), [scan, threads, lineage]);
+  const projectView = useMemo(() => (list.view === "lineage" && tree ? buildProjectView(tree) : null), [list.view, tree]);
+  // 对话视图只看对话；没有 git 的项目（或还没读到 git）在分支树视图里也照常列出对话，不画树
+  const conversations = useMemo(
+    () => (projectView ? null : buildConversations(threads, (t) => toneOf(t.indicator) === "running")),
+    [projectView, threads],
+  );
+
+  const actions = useMemo<ProjectActions>(() => {
+    const envIdByPath = new Map((lineage?.environments ?? []).map((e) => [normalizePath(e.path), e.id]));
+    const envIdOf = (node: BranchView<Thread>) => (node.worktreePath ? envIdByPath.get(normalizePath(node.worktreePath)) : undefined);
+    return {
+      projectId,
+      defaultBranch: scan?.defaultBranch ?? null,
+      canStartIn: (node) => envIdOf(node) !== undefined,
+      startIn: (node) => {
+        const environmentId = envIdOf(node);
+        if (environmentId) {
+          navigate.toCompose({ projectId, environmentId, focusPrompt: true });
+        } else {
+          // bb 还不认识这个 worktree：打开新建对话，并把路径放进剪贴板，供 Existing worktree 搜索
+          if (node.worktreePath) void copyToClipboard({ text: node.worktreePath });
+          navigate.toCompose({ projectId, hostId: lineage?.hostId, focusPrompt: true });
+        }
+        list.onNavigate();
+      },
+    };
+  }, [lineage, scan, navigate, projectId, list.onNavigate]);
+
+  const note = !scan && !isPersonal ? (loading ? "读取 git…" : lineage && lineage.result.status !== "not-git" ? "git 读取失败" : null) : null;
+
+  return (
+    <Section
+      sectionKey={`project:${projectId}`}
+      title={name}
+      count={threads.length}
+      note={note}
+      action={
+        <button
+          type="button"
+          className="wl-btn wl-reveal"
+          aria-label={`在 ${name} 新建对话`}
+          title="新建对话"
+          onClick={() => {
+            navigate.toCompose({ projectId: isPersonal ? undefined : projectId, focusPrompt: true });
+            list.onNavigate();
+          }}
+        >
+          <Glyph name="plus" size={12} />
+        </button>
+      }
+    >
+      {conversations ? (
+        <ul className="wl-tree">
+          {conversations.map((item) => (
+            <ConversationItem key={item.thread.id} item={item} />
+          ))}
+        </ul>
+      ) : projectView ? (
+        <>
+          <ul className="wl-tree">
+            {projectView.roots.map((node) => (
+              <BranchItem key={node.key} view={node} actions={actions} />
+            ))}
+            {projectView.loose.map((leaf) => (
+              <ThreadCell key={leaf.thread.id} thread={leaf.thread} origin />
+            ))}
+          </ul>
+          <ProjectFoot
+            merged={projectView.merged.filter((b) => b.threads.length > 0)}
+            idle={[...projectView.idle, ...projectView.merged.filter((b) => b.threads.length === 0)]}
+            actions={actions}
+          />
+        </>
+      ) : null}
+    </Section>
+  );
+}
+
+function nodeTitle(view: ViewNode<Thread>): string {
+  const { node } = view;
+  const name = (b: BranchView<Thread>) => b.branch ?? "分离 HEAD";
+  const lines = [
+    name(node),
+    node.worktreePath ? `worktree：${node.worktreePath}` : "没有 worktree（只是一个分叉点）",
+    view.via.length > 0 ? `来路：${[...view.via.map(name), name(node)].join(" → ")}` : null,
+    node.parentSource ? `起点依据：${SOURCE_LABEL[node.parentSource]}` : null,
+    node.ahead !== null && node.ahead > 0 ? `比起点多 ${node.ahead} 个提交` : null,
+    node.isExternal ? "在 bb 之外创建" : null,
+  ];
+  return lines.filter(Boolean).join("\n");
+}
+
+function countThreads(view: ViewNode<Thread>): number {
+  let total = [...walkThreads(view.node.threads)].length;
+  for (const child of view.children) total += countThreads(child);
+  return total;
+}
+
+/** 分支行右侧的小字标记：这条分支现在是什么状况 */
+function branchTags(node: BranchView<Thread>): string[] {
+  return [
+    node.isMain ? "主检出" : null,
+    node.merged ? "已合回" : node.ahead !== null && node.ahead > 0 ? `+${node.ahead}` : null,
+    node.worktreePath === null ? "无 worktree" : null,
+    node.isExternal ? "bb 之外" : null,
+  ].filter((tag): tag is string => tag !== null);
+}
+
+/** 一条分支上的全部对话，按最近活动排；这个视图里对话是次级行，不再按“谁派的”嵌套（派自谁用行上的小箭头表示） */
+function branchThreads(node: BranchView<Thread>): Thread[] {
+  const running = (t: Thread) => toneOf(t.indicator) === "running";
+  return [...walkThreads(node.threads)].sort((a, b) => activityOf(b, running(b)) - activityOf(a, running(a)));
+}
+
+/**
+ * 分支树视图的一个节点：分支是主行（图标 + 等宽分支名 + 右侧小字标记），它上面的对话是下面的次级行，
+ * 从它切出去的分支再缩进一格。对齐只有一条规则：下一级的图标对齐上一级文字的左缘。
+ */
+function BranchItem({ view, actions, quiet = false, depth = 0 }: { view: ViewNode<Thread>; actions: ProjectActions; quiet?: boolean; depth?: number }) {
+  const list = useList();
+  const { node } = view;
+  const threads = useMemo(() => branchThreads(node), [node]);
+  const key = `node:${actions.projectId}:${view.key}`;
+  const open = list.isOpen(key);
+  const hasKids = view.children.length > 0;
+  const hidden = hasKids && !open ? view.children.reduce((sum, child) => sum + countThreads(child), 0) : 0;
+  const tone = rollupTone(threads.map((t) => t.indicator));
+  const dim = list.focusSet !== null && !threads.some((t) => list.focusSet!.has(t.id));
+  const startHere = node.worktreePath ? { run: () => actions.startIn(node), known: actions.canStartIn(node) } : undefined;
+  const labels = pathLabels(view.via, node);
+  const leaf = labels.pop()!;
+  const tags = branchTags(node);
+
+  return (
+    <li>
+      <div className="wl-brow" title={nodeTitle(view)} data-dim={dim} data-quiet={quiet || node.merged || undefined} data-ghost={node.worktreePath === null || undefined}>
+        <span className="wl-bicon" data-tone={tone ?? undefined}>
+          <Glyph name={node.isMain ? "home" : node.branch === null ? "commit" : node.merged ? "merged" : "branch"} size={14} />
+        </span>
+        <span className="wl-bname">
+          {labels.length > 0 ? <span className="wl-bvia">{labels.join(" › ")} › </span> : null}
+          {leaf}
+        </span>
+        {tags.length > 0 ? <span className="wl-btags">{tags.join(" · ")}</span> : null}
+        {startHere ? <StartHereButton {...startHere} reveal /> : null}
+        {hasKids ? <FoldButton open={open} hidden={hidden} toggle={() => list.toggle(key)} /> : null}
+      </div>
+      {threads.length > 0 ? (
+        // 后面还有切出去的分支时，竖线要穿过最后一条对话接下去
+        <ul className="wl-tree" data-nested="true" data-continues={(hasKids && open) || undefined} style={depthStyle(depth + 1)}>
+          {threads.map((thread) => (
+            <ThreadCell key={thread.id} thread={thread} secondary origin focusChip />
+          ))}
+        </ul>
+      ) : null}
+      {hasKids ? (
+        <Collapse open={open}>
+          <ul className="wl-tree" data-nested="true" style={depthStyle(depth + 1)}>
+            {view.children.map((child) => (
+              <BranchItem key={child.key} view={child} actions={actions} quiet={quiet} depth={depth + 1} />
+            ))}
+          </ul>
+        </Collapse>
+      ) : null}
+    </li>
+  );
+}
+
+function StartHereButton({ run, known, reveal = false }: { run: () => void; known: boolean; reveal?: boolean }) {
+  return (
+    <button
+      type="button"
+      className={reveal ? "wl-btn wl-reveal" : "wl-btn"}
+      aria-label="在这个 worktree 新建对话"
+      title={known ? "在这个 worktree 新建对话" : "新建对话（路径已复制，在环境里选 Existing worktree 粘贴）"}
+      onClick={run}
+    >
+      <Glyph name="plus" size={12} />
+    </button>
+  );
+}
+
+/** 收起时常显并带上被收起的对话数；展开时只在悬停出现 */
+function FoldButton({ open, hidden, toggle }: { open: boolean; hidden: number; toggle: () => void }) {
+  return (
+    <button
+      type="button"
+      className={open ? "wl-chip wl-reveal" : "wl-chip"}
+      data-open={open}
+      aria-expanded={open}
+      title={open ? "收起从这里切出的分支" : `展开从这里切出的 ${hidden} 个对话`}
+      onClick={toggle}
+    >
+      {open ? null : hidden}
+      <Glyph name="chevron" size={8} className="wl-chev" />
+    </button>
+  );
+}
+
+/** 分支树视图的项目页脚：已合回的分支、没有对话的 worktree，各收成一个数字，点开才展开 */
+function ProjectFoot({ merged, idle, actions }: { merged: BranchView<Thread>[]; idle: BranchView<Thread>[]; actions: ProjectActions }) {
+  const list = useList();
+  const key = `foot:${actions.projectId}`;
+  const mergedThreads = useMemo(() => merged.flatMap((branch) => [...walkThreads(branch.threads)]), [merged]);
+  const holdsActive = mergedThreads.some((t) => t.id === list.activeThreadId);
+  const open = list.isOpen(key, holdsActive);
+  if (merged.length === 0 && idle.length === 0) return null;
+
+  return (
+    <div>
+      <button type="button" className="wl-foot" data-open={open} aria-expanded={open} onClick={() => list.toggle(key, holdsActive)}>
+        <Glyph name="chevron" size={9} className="wl-chev" />
+        {merged.length > 0 ? <span>已合回 {merged.length}</span> : null}
+        {merged.length > 0 && idle.length > 0 ? <span className="wl-foot-sep">·</span> : null}
+        {idle.length > 0 ? <span>空闲 worktree {idle.length}</span> : null}
+      </button>
+      <Collapse open={open}>
+        <ul className="wl-tree">
+          {[...merged, ...idle].map((branch) => (
+            <BranchItem key={branch.key} view={{ kind: "card", key: branch.key, via: [], node: branch, children: [] }} actions={actions} quiet />
+          ))}
+        </ul>
+      </Collapse>
+    </div>
+  );
+}
+
+/**
+ * 对话视图的一个节点：一条对话一行；它派出的对话缩进一格排在下面，用细拐线连着，可以整组收起。
+ * 这个视图不出现分支。
+ */
+function ConversationItem({ item, depth = 0 }: { item: Conversation<Thread>; depth?: number }) {
+  const list = useList();
+  const key = `conv:${item.thread.id}`;
+  const total = countDescendants(item);
+  // 默认展开：派出的对话是这一家正在做的事，收起是用户自己的选择
+  const open = list.isOpen(key);
+  return (
+    <ThreadCell thread={item.thread} fold={total > 0 ? { count: total, open, toggle: () => list.toggle(key) } : undefined}>
+      {total > 0 ? (
+        <Collapse open={open}>
+          <ul className="wl-tree" data-nested="true" style={depthStyle(depth + 1)}>
+            {item.children.map((child) => (
+              <ConversationItem key={child.thread.id} item={child} depth={depth + 1} />
+            ))}
+          </ul>
+        </Collapse>
+      ) : null}
+    </ThreadCell>
+  );
+}
+
+/**
+ * 带高度动画的展开 / 收起。内容在第一次展开时才挂载；收起动画结束后卸载，
+ * 这样收起的对话行不会留在 DOM 里干扰 bb 的行快捷键。
+ */
+function Collapse({ open, children }: { open: boolean; children: ReactNode }) {
+  const [mounted, setMounted] = useState(open);
+  if (open && !mounted) setMounted(true);
+  return (
+    <div
+      className="wl-collapse"
+      data-open={open}
+      inert={!open}
+      onTransitionEnd={(event) => {
+        if (event.target === event.currentTarget && !open) setMounted(false);
+      }}
+    >
+      <div className="wl-collapse-inner">{mounted ? children : null}</div>
+    </div>
+  );
+}
+
+/** 侧边栏线程 → bb 线程菜单需要的目标形状（环境 id 可能为空） */
+function actionTarget(thread: Thread) {
+  const env = thread.environment;
+  return { ...thread, environment: env?.id ? { id: env.id, path: env.path } : null };
+}
+
+/** 悬停时出现在标题行右端的快捷操作。只在行第一次被悬停后才挂载，避免每一行都订阅操作列表 */
+function QuickActions({ thread, startHere }: { thread: Thread; startHere?: { run: () => void; known: boolean } }) {
+  const target = actionTarget(thread);
+  const entries = useThreadActions(target, { keys: QUICK_ACTIONS });
+  return (
+    <span className="wl-actions">
+      {startHere ? <StartHereButton {...startHere} /> : null}
+      {entries
+        .filter((entry) => entry.action.choices === undefined)
+        .map((entry) => (
+          <button
+            key={entry.key}
+            type="button"
+            className="wl-btn"
+            aria-label={entry.action.label}
+            title={entry.action.label}
+            disabled={entry.action.disabled}
+            onClick={() => void entry.action.run()}
+          >
+            <Icon name={entry.action.icon} className="size-3.5" />
+          </button>
+        ))}
+      <ThreadActionsMenu
+        thread={target}
+        side="right"
+        align="start"
+        sideOffset={8}
+        trigger={(triggerProps) => (
+          <button {...triggerProps} type="button" className="wl-btn" aria-label="更多操作" title="更多操作">
+            <Glyph name="more" size={14} />
+          </button>
+        )}
+      />
+    </span>
+  );
+}
+
+/**
+ * 一条对话，一行：provider 图标 → 标题 → 右侧两个固定的槽。
+ * 左槽是它派出的对话数（有才出现）；右槽是状态标记或时间，二选一。悬停时右槽原地换成快捷操作
+ * （排在同一行里，不浮在别的控件上面，所以不会挡住左槽）。
+ *
+ * - sub:       第二行（只有搜索结果用：命中的那段文字、所在项目）
+ * - secondary: 分支树视图里的次级行：小一号、灰一档
+ * - fold:      对话视图里，它派出的对话可以整组收起；数量槽就是开关
+ * - focusChip: 分支树视图里，派出的对话散在各个分支上；数量槽改成“高亮它们”
+ * - origin:    它是被派出来的，而派它的对话不在它上面：标题后给一个“派自”的小箭头
+ */
+function ThreadCell({
+  thread,
+  sub,
+  secondary = false,
+  fold,
+  focusChip = false,
+  origin: showOrigin = false,
+  startHere,
+  children,
+}: {
+  thread: Thread;
+  /** 排在这一行下面、属于它的内容（它派出的对话） */
+  children?: ReactNode;
+  sub?: ReactNode;
+  secondary?: boolean;
+  fold?: { count: number; open: boolean; toggle: () => void };
+  focusChip?: boolean;
+  origin?: boolean;
+  startHere?: { run: () => void; known: boolean };
+}) {
+  const list = useList();
+  const navigate = useBbNavigate();
+  const { splitProps, layout } = useSidebarThreadSplit(thread.id);
+  const rowStatus = useSidebarThreadRowStatus(thread.id);
+  const [hot, setHot] = useState(false);
+
+  const isActive = list.activeThreadId === thread.id;
+  const isFocused = list.focusId === thread.id;
+  const dispatched = focusChip ? list.childCount.get(thread.id) ?? 0 : 0;
+  const provider = thread.providerId ? list.providersById.get(thread.providerId) : undefined;
+  const origin = showOrigin && thread.parentThreadId ? list.threadsById.get(thread.parentThreadId) : undefined;
+  // 输入框里有没发出去的内容：bb 把它单独给，不在 indicator 里。行尾画 bb 自己的铅笔，整行换成草稿色
+  const { hasUnsubmittedDraft } = useSidebarThreadDraft(thread.id);
+  const indicator = !hasUnsubmittedDraft ? thread.indicator : thread.indicator === "none" ? "draft" : thread.indicator === "runtime" ? "working-draft" : thread.indicator;
+  const showGlyph = rowStatus !== null || indicator !== "none";
+  const running = toneOf(thread.indicator) === "running";
+  const time = relativeTime(activityOf(thread, running), list.now);
+  const tone = rowTone(thread.indicator, hasUnsubmittedDraft);
+  // 首屏之后才挂载的行淡入一次
+  const arrive = useRef(list.ready).current;
+  // 状态变了（比如从运行中变成完成、变成等你回复）时，整行闪一下提示
+  const lastTone = useRef(tone);
+  const [flash, setFlash] = useState(false);
+  useEffect(() => {
+    if (lastTone.current === tone) return;
+    lastTone.current = tone;
+    if (tone === null || tone === "running" || tone === "draft") return;
+    setFlash(true);
+    const timer = setTimeout(() => setFlash(false), 1500);
+    return () => clearTimeout(timer);
+  }, [tone]);
+
+  return (
+    <li>
+      <ThreadActionsContextMenu thread={actionTarget(thread)}>
+        <div
+          className={arrive ? "wl-cell wl-arrive" : "wl-cell"}
+          data-tone={tone ?? undefined}
+          data-yours={rowColor(tone) ?? undefined}
+          data-flash={flash || undefined}
+          data-selected={list.selectedId === thread.id || undefined}
+          data-lines={sub !== undefined ? 2 : 1}
+          data-secondary={secondary || undefined}
+          data-active={isActive}
+          data-focused={isFocused}
+          data-unread={thread.isUnread}
+          data-split={!isActive && layout !== null}
+          data-dim={list.focusSet !== null && !list.focusSet.has(thread.id)}
+          onPointerEnter={(event) => {
+            if (!hot) setHot(true);
+            if (event.pointerType === "mouse") list.peekSchedule(thread, event.currentTarget);
+          }}
+          onPointerLeave={() => list.peekCancel()}
+          onFocus={hot ? undefined : () => setHot(true)}
+        >
+          {running ? <span className="wl-arc" aria-hidden="true" /> : null}
+          <a
+            className="wl-cell-link"
+            data-sidebar-thread-shortcut-target=""
+            data-sidebar-thread-id={thread.id}
+            href={thread.href}
+            draggable={false}
+            aria-label={thread.displayTitle}
+            aria-current={isActive ? "page" : undefined}
+            {...splitProps}
+            onClick={(event) => {
+              if (event.metaKey || event.ctrlKey || event.shiftKey || event.button !== 0) return;
+              event.preventDefault();
+              navigate.toThread(thread.id);
+              list.onNavigate();
+            }}
+          />
+          <div className="wl-line1">
+            <span className="wl-logo" title={provider?.displayName}>
+              {provider ? <ProviderIcon providerKind="agent" provider={provider} className="size-3.5" aria-label={provider.displayName} /> : null}
+            </span>
+            <span className="wl-title">
+              <ThreadTitle threadId={thread.id} />
+            </span>
+            {origin ? (
+              <button
+                type="button"
+                className="wl-btn"
+                style={{ width: 18, height: 18 }}
+                aria-label={`派自：${origin.displayTitle}`}
+                title={`派自：${origin.displayTitle}（点击打开）`}
+                onClick={() => {
+                  navigate.toThread(origin.id);
+                  list.onNavigate();
+                }}
+              >
+                <Glyph name="origin" size={11} />
+              </button>
+            ) : null}
+            {fold ? (
+              <button
+                type="button"
+                className="wl-chip"
+                data-open={fold.open}
+                aria-expanded={fold.open}
+                title={fold.open ? `收起它派出的 ${fold.count} 个对话` : `展开它派出的 ${fold.count} 个对话`}
+                onClick={fold.toggle}
+              >
+                <Glyph name="dispatch" size={9} />
+                {fold.count}
+              </button>
+            ) : dispatched > 0 ? (
+              <button
+                type="button"
+                className="wl-chip"
+                aria-pressed={isFocused}
+                title={isFocused ? "取消高亮" : `派出了 ${dispatched} 个对话，点击高亮它们`}
+                onClick={() => list.setFocus(isFocused ? null : thread.id)}
+              >
+                <Glyph name="dispatch" size={9} />
+                {dispatched}
+              </button>
+            ) : null}
+            <span className="wl-tail">
+              <span className="wl-slot">{showGlyph ? <ThreadStatusGlyph indicator={indicator} rowStatus={rowStatus} size="compact" /> : time}</span>
+              {hot && !list.compact ? <QuickActions thread={thread} startHere={startHere} /> : null}
+            </span>
+          </div>
+          {sub !== undefined ? <div className="wl-line2">{sub}</div> : null}
+        </div>
+      </ThreadActionsContextMenu>
+      {children}
+    </li>
+  );
+}

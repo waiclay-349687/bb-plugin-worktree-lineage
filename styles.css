@@ -1,0 +1,1229 @@
+/*
+ * Worktree 血缘侧边栏样式。
+ *
+ * 对标：T3 Code 的对话卡片（平时没有框）与 Yab 浏览器的侧边栏（悬停只换底色、选中是一块浮起的板、
+ * 标题用渐隐代替省略号、展开慢收起快、全程不回弹）；
+ * 标题最亮，分支用等宽小字退后，状态只用一个小圆点。血缘用“地铁线路图”式的节点 + 连线表达。
+ *
+ * 颜色只取宿主主题变量（--ink / --sidebar / --primary / 语义色），不写颜色字面量，
+ * 浅色、深色与自定义配色都会自动跟随。
+ */
+
+.wl-root {
+  --wl-line: color-mix(in oklch, var(--ink) 17%, var(--sidebar));
+  --wl-line-hot: color-mix(in oklch, var(--ink) 48%, var(--sidebar));
+  --wl-dot-line: color-mix(in oklch, var(--ink) 36%, var(--sidebar));
+  --wl-hover: color-mix(in oklch, var(--ink) 6.5%, var(--sidebar));
+  --wl-active: color-mix(in oklch, var(--ink) 11%, var(--sidebar));
+  --wl-active-line: color-mix(in oklab, var(--ink) 12%, transparent);
+  /*
+   * 圆角全部取自 bb 设计系统的那一套（由主题的 --radius 推出，默认 8px）：
+   *   sm = 4px：小按钮、键帽      md = 6px：对话行、菜单、输入框、分段控件
+   *   lg = 8px：卡片（预览卡）    full：胶囊、圆点
+   * bb 自带的侧边栏行、菜单是 md，卡片是 lg；这里一一对应，不另起一套。
+   */
+  --wl-r-sm: calc(var(--radius, 0.5rem) - 4px);
+  --wl-r-md: calc(var(--radius, 0.5rem) - 2px);
+  --wl-r-lg: var(--radius, 0.5rem);
+  --wl-radius: var(--wl-r-md);
+  /* Yab 的两条曲线：进来慢一点、落得稳；出去快 */
+  --wl-ease-in: cubic-bezier(0.2, 0.8, 0.2, 1);
+  --wl-chip: color-mix(in oklch, var(--ink) 11%, var(--sidebar));
+  --wl-line1: 24px; /* 标题行高 */
+  --wl-line2: 16px; /* 分支行高 */
+  --wl-pad: 5px;
+  --wl-row: 28px; /* 单行对话 */
+  --wl-label: 22px; /* 分支标签 / 分叉点 */
+
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+  padding: 2px 8px 24px;
+  color: var(--sidebar-foreground);
+  font-size: var(--text-sm, 0.8125rem);
+  line-height: 1.2;
+  -webkit-font-smoothing: antialiased;
+  /* 这是应用的侧边栏，不是文档：不可点的地方保持箭头，不出现文本光标，也不能选中文字 */
+  cursor: default;
+  user-select: none;
+  -webkit-user-select: none;
+}
+.wl-root[data-compact="true"] {
+  --wl-line1: 28px;
+  --wl-line2: 18px;
+  --wl-pad: 7px;
+  --wl-row: 38px;
+  --wl-label: 30px;
+}
+.wl-root ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+/* :where 让这条重置的优先级为 0，否则它的 font: inherit 会盖掉各个按钮自己的字号 */
+:where(.wl-root) button {
+  font: inherit;
+  color: inherit;
+  background: none;
+  border: 0;
+  padding: 0;
+}
+/* 整个侧边栏一律用箭头：按钮和对话行也不变手型，靠悬停底色表示可点 */
+.wl-root,
+.wl-root button,
+.wl-root a {
+  cursor: default;
+}
+.wl-root button:focus-visible,
+.wl-root a:focus-visible {
+  outline: 2px solid var(--sidebar-ring, var(--primary));
+  outline-offset: -2px;
+}
+.wl-grow {
+  flex: 1 1 0;
+  min-width: 0;
+}
+
+/* ── 顶栏 ─────────────────────────────────────────────── */
+.wl-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  position: sticky;
+  top: 0;
+  z-index: 4;
+  margin: 0 -8px -10px;
+  padding: 4px 8px 6px;
+  background: var(--sidebar);
+}
+/* 滚动内容从顶栏下面淡出，而不是被一刀切断 */
+.wl-bar::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 100%;
+  height: 10px;
+  background: linear-gradient(var(--sidebar), transparent);
+  pointer-events: none;
+}
+.wl-seg {
+  position: relative;
+  display: inline-grid;
+  grid-template-columns: 1fr 1fr;
+  padding: 2px;
+  border-radius: var(--wl-r-md);
+  background: color-mix(in oklab, var(--ink) 7%, transparent);
+}
+/* 滑块：切换排列时从一边滑到另一边 */
+.wl-seg::before {
+  content: "";
+  position: absolute;
+  top: 2px;
+  bottom: 2px;
+  left: 2px;
+  width: calc(50% - 2px);
+  border-radius: var(--wl-r-sm);
+  background: color-mix(in oklab, var(--ink) 12%, transparent);
+  transition: transform 0.22s cubic-bezier(0.3, 0.7, 0.2, 1);
+}
+.wl-seg[data-view="lineage"]::before {
+  transform: translateX(100%);
+}
+.wl-seg button {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  height: 22px;
+  padding: 0 9px;
+  border-radius: var(--wl-r-sm);
+  font-size: var(--text-2xs, 0.6875rem);
+  font-weight: 500;
+  color: var(--subtle-foreground);
+  transition: color 0.15s ease;
+}
+.wl-seg button:hover,
+.wl-seg button[aria-pressed="true"] {
+  color: var(--sidebar-foreground);
+}
+.wl-root[data-compact="true"] .wl-seg button {
+  height: 30px;
+  padding: 0 12px;
+  font-size: var(--text-xs, 0.75rem);
+}
+.wl-btn {
+  position: relative;
+  z-index: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  width: 22px;
+  height: 22px;
+  border-radius: var(--wl-r-sm);
+  color: var(--subtle-foreground);
+  pointer-events: auto;
+  transition: color 0.12s ease, background-color 0.12s ease, opacity 0.12s ease;
+}
+.wl-root .wl-btn:hover {
+  color: var(--sidebar-foreground);
+  background: color-mix(in oklab, var(--ink) 12%, transparent);
+}
+.wl-root button:disabled {
+  opacity: 0.4;
+}
+.wl-root[data-compact="true"] .wl-btn {
+  width: 32px;
+  height: 32px;
+}
+.wl-clear {
+  height: 22px;
+  padding: 0 8px !important;
+  border-radius: var(--wl-r-sm);
+  font-size: var(--text-2xs, 0.6875rem);
+  color: var(--primary) !important;
+  background: color-mix(in oklab, var(--primary) 14%, transparent) !important;
+}
+
+/* 快速筛选输入框：占满顶栏；这是唯一会出现文本光标的地方 */
+.wl-search {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 1 1 0;
+  min-width: 0;
+  height: 26px;
+  padding: 0 4px 0 8px;
+  border-radius: var(--wl-r-md);
+  color: var(--subtle-foreground);
+  background: color-mix(in oklab, var(--ink) 7%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in oklab, var(--ink) 14%, transparent);
+  transition: box-shadow 0.15s ease;
+}
+.wl-search:focus-within {
+  box-shadow: inset 0 0 0 1px color-mix(in oklch, var(--primary) 60%, transparent);
+}
+.wl-search input {
+  flex: 1 1 0;
+  min-width: 0;
+  border: 0;
+  outline: 0;
+  background: none;
+  font: inherit;
+  font-size: var(--text-xs, 0.75rem);
+  color: var(--sidebar-foreground);
+  cursor: text;
+  user-select: text;
+  -webkit-user-select: text;
+}
+.wl-search input::placeholder {
+  color: var(--subtle-foreground);
+  opacity: 0.8;
+}
+.wl-kbd {
+  flex: none;
+  height: 16px;
+  padding: 0 5px;
+  border-radius: var(--wl-r-sm);
+  font-size: 10px;
+  line-height: 1;
+  color: var(--subtle-foreground);
+  background: color-mix(in oklab, var(--ink) 9%, transparent);
+}
+.wl-kbd:hover {
+  color: var(--sidebar-foreground);
+}
+.wl-root[data-compact="true"] .wl-search {
+  height: 34px;
+}
+/* 搜索命中的那段文字：命中的词用正文色加重，不用底色块 */
+.wl-snippet {
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 24px), transparent);
+  mask-image: linear-gradient(to right, #000 calc(100% - 24px), transparent);
+  font-size: var(--text-2xs, 0.6875rem);
+  color: var(--subtle-foreground);
+}
+.wl-snippet mark {
+  background: none;
+  color: var(--sidebar-foreground);
+  font-weight: 600;
+}
+.wl-empty {
+  padding: 4px 6px;
+  font-size: var(--text-2xs, 0.6875rem);
+  color: var(--subtle-foreground);
+}
+/* 方向键选中的结果 */
+.wl-cell[data-selected] {
+  --wl-bg: var(--wl-active);
+  box-shadow: inset 0 0 0 1px color-mix(in oklch, var(--primary) 55%, transparent);
+}
+
+/* ── 分区（项目 / 置顶） ───────────────────────────────── */
+.wl-section-head {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  height: 28px;
+  margin-bottom: 1px;
+}
+.wl-section-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  flex: 1 1 0;
+  height: 100%;
+  /* 名称左缘 = 下面对话图标的左缘 */
+  padding: 0 4px 0 6px;
+  text-align: left;
+}
+/* 分组名和行同字号，只是加粗、用灰一档的颜色 */
+.wl-section-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--text-sm, 0.8125rem);
+  font-weight: 600;
+  color: var(--muted-foreground);
+}
+.wl-section-toggle:hover .wl-section-name {
+  color: var(--sidebar-foreground);
+}
+/* 折叠箭头：展开时只在悬停才出现，收起时一直在（提示里面有东西） */
+.wl-section-toggle[data-open="true"] > .wl-chev {
+  opacity: 0;
+  transition: opacity 0.14s ease-out, transform 0.16s ease;
+}
+.wl-section-head:hover .wl-section-toggle > .wl-chev {
+  opacity: 1;
+}
+@media (hover: none) {
+  .wl-section-toggle[data-open="true"] > .wl-chev {
+    opacity: 1;
+  }
+}
+.wl-count {
+  flex: none;
+  font-size: var(--text-2xs, 0.6875rem);
+  font-variant-numeric: tabular-nums;
+  color: var(--subtle-foreground);
+}
+.wl-chev {
+  flex: none;
+  color: var(--subtle-foreground);
+  transition: transform 0.16s ease;
+}
+[data-open="true"] > .wl-chev {
+  transform: rotate(90deg);
+}
+
+/* ── 状态色 ───────────────────────────────────────────── */
+[data-tone="running"] {
+  --wl-tone: var(--primary);
+}
+/* 蓝 = 它停下来等你。等你回复的小标记也用它，和整行的底色一个意思 */
+[data-tone="attention"] {
+  --wl-tone: var(--ansi-4, var(--primary));
+}
+[data-tone="error"] {
+  --wl-tone: var(--destructive);
+}
+[data-tone="done"] {
+  --wl-tone: var(--success);
+}
+/* 黄 = 你自己写了一半没发 */
+[data-tone="draft"] {
+  --wl-tone: var(--attention);
+}
+
+/* ── 树形列表：两个视图共用 ───────────────────────────────
+   对齐只有一条规则：下一级的图标对齐上一级文字的左缘。
+   一级 = 16px 图标 + 7px 间距 = 23px；嵌套层数写在 --wl-depth 上（由组件给），行的缩进和连线的位置都由它算。
+   行是通栏的（悬停底色不随缩进变窄），缩进只是行内的左内边距。 */
+.wl-tree {
+  --wl-step: 23px;
+}
+.wl-tree > li {
+  position: relative;
+  /* 行距用内边距而不是 gap：这样每个 li 首尾相接，竖线才连得上 */
+  padding-bottom: 2px;
+}
+.wl-tree .wl-cell,
+.wl-tree .wl-brow {
+  padding-left: calc(6px + var(--wl-depth, 0) * var(--wl-step));
+}
+/* 连线：一条竖线从上一级图标的正下方垂下，在每个下级那一行拐一个圆角伸到它的图标前 */
+.wl-tree[data-nested="true"] > li::before {
+  content: "";
+  position: absolute;
+  z-index: 1;
+  left: calc(13.5px + (var(--wl-depth) - 1) * var(--wl-step));
+  top: 0;
+  width: 12px;
+  height: calc(var(--wl-row) / 2);
+  box-sizing: border-box;
+  border-left: 1px solid var(--wl-line);
+  border-bottom: 1px solid var(--wl-line);
+  border-bottom-left-radius: 6px;
+  pointer-events: none;
+}
+/* 竖线穿过除最后一个以外的兄弟；后面还接着别的下级（同一条分支上切出去的分支）时，最后一个也穿过 */
+.wl-tree[data-nested="true"] > li:not(:last-child)::after,
+.wl-tree[data-nested="true"][data-continues="true"] > li:last-child::after {
+  content: "";
+  position: absolute;
+  z-index: 1;
+  left: calc(13.5px + (var(--wl-depth) - 1) * var(--wl-step));
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: var(--wl-line);
+  pointer-events: none;
+}
+
+/* ── 分支名（等宽小字） ───────────────────────────────── */
+.wl-path {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: var(--text-2xs, 0.6875rem);
+  letter-spacing: -0.01em;
+  white-space: nowrap;
+  color: var(--subtle-foreground);
+}
+.wl-path-via {
+  flex: 0 999 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  opacity: 0.65;
+}
+.wl-path-leaf {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.wl-path[data-ghost="true"] .wl-path-leaf {
+  font-style: italic;
+  opacity: 0.8;
+}
+
+/* ── 分支行（分支树视图的主行） ─────────────────────────── */
+.wl-brow {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  height: var(--wl-row);
+  padding-right: 4px;
+  border-radius: var(--wl-radius);
+  transition: opacity 0.2s ease;
+}
+.wl-bicon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  width: 16px;
+  height: 16px;
+  color: var(--muted-foreground);
+}
+/* 这条分支上有对话需要注意时，分支图标带上那个状态的颜色（收起时也看得见） */
+.wl-bicon[data-tone] {
+  color: var(--wl-tone);
+}
+.wl-bname {
+  flex: 1 1 0;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: var(--text-xs, 0.75rem);
+  letter-spacing: -0.01em;
+  color: var(--sidebar-foreground);
+  -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 20px), transparent);
+  mask-image: linear-gradient(to right, #000 calc(100% - 20px), transparent);
+}
+.wl-bvia {
+  color: var(--subtle-foreground);
+}
+.wl-btags {
+  flex: none;
+  font-size: var(--text-2xs, 0.6875rem);
+  font-variant-numeric: tabular-nums;
+  color: var(--subtle-foreground);
+}
+/* 已合回、没有 worktree 的分支退后一档：它们是历史或路标，不是正在干活的地方 */
+.wl-brow[data-quiet] .wl-bname,
+.wl-brow[data-ghost] .wl-bname {
+  color: var(--muted-foreground);
+}
+.wl-brow[data-ghost] .wl-bname {
+  font-style: italic;
+}
+.wl-brow .wl-btn {
+  width: 20px;
+  height: 20px;
+  border-radius: var(--wl-r-sm);
+}
+/* 分支行右侧：平时是小字标记，贴着和对话行的时间同一条右边线；悬停时原地换成按钮（不占位，标记才对得齐） */
+.wl-brow .wl-reveal {
+  display: none;
+}
+@media (hover: hover) {
+  .wl-brow:hover .wl-reveal,
+  .wl-brow:focus-within .wl-reveal {
+    display: inline-flex;
+  }
+  .wl-brow:hover .wl-btags,
+  .wl-brow:focus-within .wl-btags {
+    display: none;
+  }
+}
+@media (hover: none) {
+  .wl-brow .wl-reveal {
+    display: inline-flex;
+  }
+}
+.wl-root[data-compact="true"] .wl-brow .wl-reveal {
+  display: inline-flex;
+}
+.wl-root[data-compact="true"] .wl-brow .wl-btn {
+  width: 28px;
+  height: 28px;
+}
+
+/* ── 对话 ─────────────────────────────────────────────── */
+.wl-cell {
+  --wl-bg: transparent;
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  min-height: var(--wl-row);
+  padding: 0 4px 0 6px;
+  border-radius: var(--wl-radius);
+  background: var(--wl-bg);
+  /* 悬停底色是瞬时的（不做过渡），列表才显得跟手；只有被淡出时才过渡 */
+  transition: opacity 0.2s ease;
+}
+.wl-cell[data-lines="2"] {
+  padding-top: var(--wl-pad);
+  padding-bottom: var(--wl-pad);
+}
+@media (hover: hover) {
+  .wl-cell:hover {
+    --wl-bg: var(--wl-hover);
+  }
+}
+.wl-cell[data-split="true"] {
+  --wl-bg: color-mix(in oklch, var(--ink) 4%, var(--sidebar));
+}
+/* 选中：一块浮起来的板——底色亮一档、一圈很淡的内描边、底下一点点投影 */
+.wl-cell[data-active="true"] {
+  --wl-bg: var(--wl-active);
+  box-shadow:
+    inset 0 0 0 1px var(--wl-active-line),
+    0 1px 3px color-mix(in oklab, black 14%, transparent);
+}
+.wl-cell[data-focused="true"] {
+  --wl-bg: color-mix(in oklch, var(--primary) 16%, var(--sidebar));
+}
+.wl-cell-link {
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+}
+.wl-line1 {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  height: var(--wl-line1);
+  pointer-events: none;
+}
+.wl-cell[data-lines="1"] .wl-line1 {
+  height: var(--wl-row);
+}
+.wl-logo {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  width: 16px;
+  height: 16px;
+  color: var(--muted-foreground);
+}
+.wl-title {
+  flex: 1 1 0;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  /* 太长的标题在末尾渐隐，不用省略号 */
+  -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 28px), transparent);
+  mask-image: linear-gradient(to right, #000 calc(100% - 28px), transparent);
+  color: color-mix(in oklch, var(--ink) 84%, var(--sidebar));
+}
+/* 标题里 bb 自己的截断省略号让位给渐隐 */
+.wl-title * {
+  text-overflow: clip !important;
+}
+.wl-cell:hover .wl-title,
+.wl-cell[data-active="true"] .wl-title,
+.wl-cell[data-unread="true"] .wl-title {
+  color: var(--sidebar-foreground);
+}
+.wl-cell[data-unread="true"] .wl-title {
+  font-weight: 600;
+}
+.wl-cell[data-quiet="true"] .wl-title {
+  color: var(--muted-foreground);
+}
+/*
+ * 颜色即含义，整行的底色有三种：
+ *   黄 = 输入框里有没发出去的内容（你自己欠着的）
+ *   蓝 = 它停下来等你（问了问题，或者出错了；行尾的标记区分这两种）
+ *   绿 = 做完了，你还没看
+ * 一眼扫过去，有底色的行就是有事找你的行。底色用渐变层叠在悬停 / 选中的底色之上，两者互不覆盖。
+ * 变量叫 --wl-hue：不能叫 --wl-row，那是行高。
+ */
+.wl-cell[data-yours="draft"] {
+  --wl-hue: var(--attention);
+}
+.wl-cell[data-yours="waiting"] {
+  --wl-hue: var(--ansi-4, var(--primary));
+}
+.wl-cell[data-yours="done"] {
+  --wl-hue: var(--success);
+}
+.wl-cell[data-yours] {
+  background-image: linear-gradient(color-mix(in oklab, var(--wl-hue) 11%, transparent), color-mix(in oklab, var(--wl-hue) 11%, transparent));
+}
+.wl-cell[data-yours] .wl-title,
+.wl-cell[data-yours]:hover .wl-title {
+  color: color-mix(in oklab, var(--wl-hue) 58%, var(--sidebar-foreground));
+}
+/* 分支树视图里的对话是次级行：小一号、灰一档（悬停、选中、有事找你时恢复正文色） */
+.wl-cell[data-secondary] .wl-title {
+  font-size: var(--text-xs, 0.75rem);
+  color: var(--muted-foreground);
+}
+.wl-cell[data-secondary]:hover .wl-title,
+.wl-cell[data-secondary][data-active="true"] .wl-title,
+.wl-cell[data-secondary][data-unread="true"] .wl-title {
+  color: var(--sidebar-foreground);
+}
+.wl-line2 {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: var(--wl-line2);
+  padding-left: 23px; /* 与标题左缘对齐：图标 16 + 间距 7 */
+  pointer-events: none;
+}
+.wl-line1 > button,
+.wl-line2 > button {
+  pointer-events: auto;
+}
+.wl-time {
+  flex: none;
+  font-size: var(--text-2xs, 0.6875rem);
+  font-variant-numeric: tabular-nums;
+  color: var(--subtle-foreground);
+  opacity: 0.85;
+}
+.wl-status {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  min-width: 16px;
+  height: 16px;
+}
+/*
+ * 行尾：平时是状态 / 时间，悬停时原地换成快捷操作。
+ * 快捷操作排在这一行的文档流里（不是浮层），所以标题会让位，旁边的折叠按钮永远不会被盖住。
+ */
+.wl-tail {
+  display: inline-flex;
+  align-items: center;
+  flex: none;
+  pointer-events: auto;
+}
+/* 右槽：固定宽度、靠右，放状态标记或时间；每一行的这个位置都对得齐 */
+.wl-slot {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex: none;
+  min-width: 26px;
+  height: 16px;
+  /* 11px：比 bb 的最小字号（这里是 10px）大一档，时间才看得清 */
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  color: var(--subtle-foreground);
+  pointer-events: none;
+}
+.wl-actions {
+  display: none;
+  align-items: center;
+  gap: 1px;
+  margin-right: -2px;
+}
+@media (hover: hover) {
+  .wl-cell:hover .wl-actions,
+  .wl-cell:focus-within .wl-actions,
+  .wl-cell:has(.wl-actions [data-state="open"]) .wl-actions {
+    display: inline-flex;
+  }
+  .wl-cell:hover .wl-tail:has(.wl-actions) .wl-slot,
+  .wl-cell:focus-within .wl-tail:has(.wl-actions) .wl-slot,
+  .wl-cell:has(.wl-actions [data-state="open"]) .wl-slot {
+    display: none;
+  }
+}
+.wl-actions .wl-btn {
+  width: 22px;
+  height: 22px;
+}
+
+/* “from 起点”跟在分支名后面，淡一档（搜索结果的第二行用） */
+.wl-path-leaf + .wl-path-via {
+  flex: 0 999 auto;
+  margin-left: 2px;
+}
+.wl-line2 > .wl-path {
+  flex: 0 1 auto;
+}
+
+/* ── 小胶囊：派出了几个对话 ───────────────────────────── */
+.wl-chip {
+  position: relative;
+  z-index: 1;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  flex: none;
+  height: 16px;
+  padding: 0 5px;
+  border-radius: 999px;
+  background: var(--wl-chip);
+  color: var(--subtle-foreground);
+  font-size: 10.5px;
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+  pointer-events: auto;
+  transition: background-color 0.15s ease, color 0.15s ease, transform 0.1s ease;
+}
+.wl-chip:hover {
+  color: var(--sidebar-foreground);
+  background: color-mix(in oklch, var(--ink) 18%, var(--sidebar));
+}
+.wl-chip:active,
+.wl-btn:active {
+  transform: scale(0.92);
+}
+.wl-chip[aria-pressed="true"] {
+  color: var(--primary);
+  background: color-mix(in oklch, var(--primary) 24%, var(--sidebar));
+}
+.wl-root[data-compact="true"] .wl-chip {
+  height: 20px;
+  padding: 0 7px;
+  font-size: 12px;
+}
+/* 触屏下：外观保持小巧，点击区域向外撑大 */
+.wl-root[data-compact="true"] .wl-chip::after {
+  content: "";
+  position: absolute;
+  inset: -9px -6px;
+}
+
+/* ── 悬停才出现的操作；触屏没有悬停，所以常显 ─────────── */
+.wl-reveal {
+  opacity: 0;
+}
+*:hover > .wl-reveal,
+.wl-brow:hover .wl-reveal,
+.wl-reveal:focus-visible {
+  opacity: 1;
+}
+@media (hover: none) {
+  .wl-reveal {
+    opacity: 1;
+  }
+}
+.wl-root[data-compact="true"] .wl-reveal {
+  opacity: 1;
+}
+
+/* ── 项目页脚：已合回 / 空闲 worktree ─────────────────── */
+.wl-foot {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  height: 24px;
+  margin-top: 4px;
+  padding: 0 6px 0 4px !important;
+  border-radius: var(--wl-r-md);
+  text-align: left;
+  font-size: var(--text-2xs, 0.6875rem);
+  color: var(--subtle-foreground);
+  transition: color 0.15s ease, background-color 0.15s ease;
+}
+.wl-foot:hover {
+  color: var(--muted-foreground);
+  background: var(--wl-hover);
+}
+.wl-root[data-compact="true"] .wl-foot {
+  height: 34px;
+}
+.wl-foot-sep {
+  opacity: 0.5;
+}
+.wl-foot-dot {
+  flex: none;
+  width: 6px;
+  height: 6px;
+  border-radius: 999px;
+  background: var(--wl-tone);
+}
+
+/* ── 指挥官高亮：无关的淡出 ───────────────────────────── */
+.wl-root[data-focus="true"] [data-dim="true"] {
+  opacity: 0.3;
+}
+
+/* ── 动效（都 ≤ 0.25s，只做有用的：告诉你什么变了、东西从哪来到哪去） ── */
+
+/* 展开 / 收起：高度平滑过渡，内容跟着淡入淡出 */
+.wl-collapse {
+  display: grid;
+  grid-template-rows: 0fr;
+  transition: grid-template-rows 0.14s ease-out; /* 收起：快 */
+}
+.wl-collapse[data-open="true"] {
+  grid-template-rows: 1fr;
+  transition: grid-template-rows 0.22s var(--wl-ease-in); /* 展开：慢一点、落得稳 */
+}
+.wl-collapse-inner {
+  min-height: 0;
+  overflow: hidden;
+  opacity: 0;
+  transition: opacity 0.14s ease-out;
+}
+.wl-collapse[data-open="true"] > .wl-collapse-inner {
+  opacity: 1;
+}
+/* 首屏之后才出现的行：新来的、展开出来的、切换排列后的，淡入一次 */
+.wl-arrive {
+  animation: wl-in 0.2s ease-out;
+}
+/* 悬停时快捷操作从右边滑进来 */
+.wl-actions {
+  animation: wl-slide 0.14s ease-out;
+}
+/*
+ * 运行中：行的外缘有一圈很细的流光描边，一道斜向的光带匀速扫过（做法参考 Hermes desktop）。
+ * 只有 1.25px 的边在动，标题和内容都是静止的，所以同时有几条在跑也不吵。
+ * 光层是行的 240% 大、只做 transform 位移，走合成层，不触发重排。
+ */
+.wl-arc {
+  --wl-arc-c1: var(--primary);
+  --wl-arc-c2: color-mix(in srgb, var(--primary) 45%, transparent);
+  position: absolute;
+  inset: 0;
+  padding: 1.25px;
+  border-radius: inherit;
+  overflow: hidden;
+  pointer-events: none;
+  mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+  mask-composite: exclude;
+}
+.wl-arc::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 240%;
+  height: 240%;
+  background: repeating-linear-gradient(
+    160deg,
+    transparent 0%,
+    transparent 18.75%,
+    var(--wl-arc-c1) 25%,
+    var(--wl-arc-c2) 31.25%,
+    transparent 43.75%,
+    transparent 50%
+  );
+  will-change: transform;
+  animation: wl-arc 2.23s linear infinite;
+}
+@keyframes wl-arc {
+  to {
+    transform: translate(-50%, -50%);
+  }
+}
+/* 状态刚变（完成 / 等你回复 / 出错）：整行用状态色亮一下再褪去 */
+.wl-cell[data-flash]::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  background: var(--wl-tone);
+  opacity: 0;
+  pointer-events: none;
+  animation: wl-flash 1.4s ease-out;
+}
+.wl-enter {
+  animation: wl-in 0.18s ease-out;
+}
+.wl-spin {
+  animation: wl-spin 0.9s linear infinite;
+}
+@keyframes wl-in {
+  from {
+    opacity: 0;
+    transform: translateY(-3px);
+  }
+}
+@keyframes wl-slide {
+  from {
+    opacity: 0;
+    transform: translateX(5px);
+  }
+}
+@keyframes wl-draw {
+  from {
+    transform: scaleY(0);
+  }
+}
+@keyframes wl-flash {
+  0% {
+    opacity: 0;
+  }
+  18% {
+    opacity: 0.22;
+  }
+  100% {
+    opacity: 0;
+  }
+}
+@keyframes wl-breathe {
+  0%,
+  100% {
+    opacity: 0.45;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+@keyframes wl-ping {
+  0% {
+    transform: scale(1);
+    opacity: 0.7;
+  }
+  70%,
+  100% {
+    transform: scale(2.4);
+    opacity: 0;
+  }
+}
+@keyframes wl-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .wl-root *,
+  .wl-root *::before,
+  .wl-root *::after {
+    animation: none !important;
+    transition: none !important;
+  }
+}
+
+/* ── 悬停预览卡 ───────────────────────────────────────────
+   渲染在 document.body 上（不在 .wl-root 里），所以这里要用到的变量自己定义一遍。 */
+.wl-peek {
+  position: fixed;
+  z-index: 60;
+  /* 够放下“阶段名 + 一句结论”；窄窗口里不超出视口 */
+  width: min(380px, calc(100vw - 24px));
+  /* 高度由脚本按内容设定并做过渡，所以内容超出的部分要裁掉；描边画在阴影里，不占高度 */
+  overflow: hidden;
+  border-radius: var(--radius, 0.5rem);
+  background: var(--popover, var(--canvas));
+  color: var(--popover-foreground, var(--ink));
+  box-shadow:
+    0 0 0 1px color-mix(in oklch, var(--ink) 14%, var(--canvas)),
+    0 6px 16px color-mix(in oklab, black 16%, transparent),
+    0 1px 3px color-mix(in oklab, black 10%, transparent);
+  font-size: var(--text-xs, 0.75rem);
+  line-height: 1.45;
+  /* 鼠标可以移上来：卡片不会消失，里面的文字能选中、能复制 */
+  pointer-events: auto;
+  cursor: text;
+  user-select: text;
+  -webkit-user-select: text;
+  -webkit-font-smoothing: antialiased;
+  transform-origin: left center;
+  animation: wl-peek-in 0.16s cubic-bezier(0.3, 0.7, 0.2, 1);
+}
+/* 在对话之间移动：同一张卡片滑到新的一行旁边，同时长高或变矮（第一次定位不做过渡） */
+.wl-peek[data-settled] {
+  transition:
+    top 0.24s cubic-bezier(0.3, 0.7, 0.2, 1),
+    height 0.24s cubic-bezier(0.3, 0.7, 0.2, 1);
+}
+.wl-peek-body,
+.wl-peek-ghost {
+  padding: 13px 14px;
+}
+/* 上一条对话的残影：叠在新内容上面淡出 */
+.wl-peek-ghost {
+  position: absolute;
+  inset: 0 0 auto 0;
+  pointer-events: none;
+  user-select: none;
+  -webkit-user-select: none;
+}
+.wl-peek-ghost:empty {
+  display: none;
+}
+.wl-peek-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 7px;
+}
+.wl-peek-logo {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  width: 16px;
+  height: 18px;
+  color: var(--muted-foreground);
+}
+.wl-peek-title {
+  min-width: 0;
+  font-size: var(--text-sm, 0.8125rem);
+  font-weight: 600;
+  line-height: 1.35;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.wl-peek-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0 6px;
+  margin: 2px 0 0 23px;
+  font-size: var(--text-2xs, 0.6875rem);
+  color: var(--subtle-foreground);
+}
+.wl-peek-meta > span + span::before {
+  content: "·";
+  margin-right: 6px;
+  opacity: 0.6;
+}
+/* 全程速览：一句话 + 一条竖着的阶段轨道 */
+.wl-peek-brief {
+  margin: 10px 0 0;
+  padding-top: 10px;
+  border-top: 1px solid color-mix(in oklch, var(--ink) 10%, var(--canvas));
+}
+.wl-peek-about {
+  margin: 0;
+  font-weight: 500;
+  color: var(--popover-foreground, var(--ink));
+  overflow-wrap: anywhere;
+}
+.wl-peek-stages {
+  list-style: none;
+  margin: 9px 0 0;
+  padding: 0;
+}
+.wl-peek-stages > li {
+  position: relative;
+  display: grid;
+  grid-template-columns: 14px 1fr;
+  column-gap: 9px;
+  padding-bottom: 8px;
+}
+.wl-peek-stages > li:last-child {
+  padding-bottom: 0;
+}
+/* 轨道：把相邻两个标记连起来，最后一个阶段后面不画 */
+.wl-peek-stages > li:not(:last-child)::before {
+  content: "";
+  position: absolute;
+  left: 6.5px;
+  top: 17px;
+  bottom: 1px;
+  width: 1px;
+  background: color-mix(in oklch, var(--ink) 14%, var(--canvas));
+}
+.wl-peek-mark {
+  grid-row: 1 / span 2;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  height: 14px;
+  margin-top: 2px;
+  border-radius: 999px;
+  color: var(--muted-foreground);
+  background: color-mix(in oklch, var(--ink) 9%, var(--canvas));
+}
+.wl-peek-mark[data-state="done"] {
+  color: var(--success);
+  /* oklab：在 oklch 里往近白色混会绕色相，绿色会发粉 */
+  background: color-mix(in oklab, var(--success) 16%, var(--canvas));
+}
+/* 进行中：一个实心点，和列表里“运行中”同一个颜色 */
+.wl-peek-mark[data-state="doing"] {
+  background: color-mix(in oklab, var(--primary) 18%, var(--canvas));
+}
+.wl-peek-mark[data-state="doing"]::after {
+  content: "";
+  width: 6px;
+  height: 6px;
+  border-radius: 999px;
+  background: var(--primary);
+}
+.wl-peek-stage-title {
+  grid-column: 2;
+  min-width: 0;
+  font-weight: 500;
+  color: var(--popover-foreground, var(--ink));
+  overflow-wrap: anywhere;
+}
+.wl-peek-stage-note {
+  grid-column: 2;
+  min-width: 0;
+  font-size: var(--text-2xs, 0.6875rem);
+  line-height: 1.5;
+  color: var(--muted-foreground);
+  overflow-wrap: anywhere;
+}
+/* 放弃的方向退后一档：它是历史，不是进展 */
+.wl-peek-stages > li[data-state="dropped"] .wl-peek-stage-title {
+  font-weight: 400;
+  color: var(--muted-foreground);
+}
+.wl-peek-stages > li[data-state="dropped"] .wl-peek-stage-note {
+  color: var(--subtle-foreground);
+}
+.wl-peek-behind {
+  margin: 8px 0 0;
+  font-size: var(--text-2xs, 0.6875rem);
+  color: var(--subtle-foreground);
+}
+.wl-peek-recap dt[data-tone] {
+  color: var(--wl-tone);
+}
+/* 进展摘要：左边一列小标签，右边是内容 */
+.wl-peek-recap {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 7px 10px;
+  margin: 10px 0 0;
+  padding-top: 10px;
+  border-top: 1px solid color-mix(in oklch, var(--ink) 10%, var(--canvas));
+}
+.wl-peek-recap:empty {
+  display: none;
+}
+.wl-peek-recap dt {
+  font-size: var(--text-2xs, 0.6875rem);
+  line-height: 1.6;
+  color: var(--subtle-foreground);
+  white-space: nowrap;
+}
+.wl-peek-recap dd {
+  margin: 0;
+  min-width: 0;
+  color: var(--popover-foreground, var(--ink));
+  overflow-wrap: anywhere;
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+/* 答复是主角：正文色；要求和进展退后一档 */
+.wl-peek-recap dd[data-quiet="true"] {
+  color: var(--muted-foreground);
+}
+.wl-peek-meta > span[data-tone] {
+  color: var(--wl-tone);
+}
+.wl-peek-recap b {
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+}
+.wl-peek-recap b[data-kind="add"] {
+  color: var(--diff-added, var(--success));
+}
+.wl-peek-recap b[data-kind="del"] {
+  color: var(--diff-removed, var(--destructive));
+}
+.wl-peek-foot {
+  margin-top: 10px;
+  padding-top: 8px;
+  border-top: 1px solid color-mix(in oklch, var(--ink) 10%, var(--canvas));
+}
+.wl-peek-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 7px;
+  padding: 1px 0;
+  font-size: var(--text-2xs, 0.6875rem);
+  color: var(--subtle-foreground);
+}
+.wl-peek-row > svg {
+  margin: 2.5px 0 0;
+}
+.wl-peek-row > span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.wl-peek-mono {
+  font-family: var(--font-mono, ui-monospace, monospace);
+  letter-spacing: -0.01em;
+}
+.wl-peek-mono em {
+  font-style: normal;
+  opacity: 0.65;
+}
+@keyframes wl-fade {
+  from {
+    opacity: 0;
+  }
+}
+@keyframes wl-peek-in {
+  from {
+    opacity: 0;
+    transform: translateX(-4px) scale(0.98);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .wl-peek,
+  .wl-peek[data-settled] {
+    animation: none;
+    transition: none;
+  }
+}
