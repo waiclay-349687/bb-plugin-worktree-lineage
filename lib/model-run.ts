@@ -22,9 +22,9 @@ const MAX_OUTPUT = 4 * 1024 * 1024;
 /** 网关一问一答的上限：实测免费 DeepSeek 2–5s，超过这么久多半是网关卡住了，及时回退到 claude */
 export const GATEWAY_TIMEOUT_MS = 45_000;
 
-/** 429 没带 Retry-After 时冷却 15 分钟；带了也最多 2 小时（免费额度常给一小时） */
+/** 429 没带 Retry-After 时冷却 15 分钟；带了也最多 25 分钟（免费额度报 1 小时常约 20 分钟就恢复） */
 export const RATE_LIMIT_DEFAULT_COOLDOWN_MS = 15 * 60_000;
-export const RATE_LIMIT_MAX_COOLDOWN_MS = 2 * 60 * 60_000;
+export const RATE_LIMIT_MAX_COOLDOWN_MS = 25 * 60_000;
 /** 网关整个连不上（没启动、端口不对）：短冷却，网关起来后很快恢复 */
 export const UNREACHABLE_COOLDOWN_MS = 60_000;
 

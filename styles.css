@@ -171,6 +171,9 @@
   color: var(--sidebar-foreground);
   background: color-mix(in oklab, var(--ink) 12%, transparent);
 }
+.wl-btn[data-copied="true"] {
+  color: var(--success) !important;
+}
 .wl-root button:disabled {
   opacity: 0.4;
 }
@@ -185,6 +188,48 @@
   font-size: var(--text-2xs, 0.6875rem);
   color: var(--primary) !important;
   background: color-mix(in oklab, var(--primary) 14%, transparent) !important;
+}
+/* 顶栏“需要我”快速跳转徽标：颜色复用三色语义，点击或按 ] / [ 循环跳转 */
+.wl-attn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  flex: none;
+  height: 22px;
+  padding: 0 7px !important;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+  background: color-mix(in oklab, var(--wl-hue) 14%, transparent) !important;
+  color: color-mix(in oklab, var(--wl-hue) 68%, var(--sidebar-foreground)) !important;
+  transition: background-color 0.14s ease, transform 0.1s ease;
+}
+.wl-attn[data-yours="draft"] {
+  --wl-hue: var(--attention);
+}
+.wl-attn[data-yours="waiting"] {
+  --wl-hue: var(--ansi-4, var(--primary));
+}
+.wl-attn[data-yours="done"] {
+  --wl-hue: var(--success);
+}
+.wl-attn:hover {
+  background: color-mix(in oklab, var(--wl-hue) 22%, transparent) !important;
+}
+.wl-attn:active {
+  transform: scale(0.94);
+}
+.wl-attn-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 999px;
+  background: var(--wl-hue);
+}
+.wl-root[data-compact="true"] .wl-attn {
+  height: 30px;
+  padding: 0 9px !important;
+  font-size: var(--text-xs, 0.75rem);
 }
 
 /* 快速筛选输入框：占满顶栏；这是唯一会出现文本光标的地方 */

@@ -66,6 +66,27 @@ const PATHS = {
       <path d="M4.5 5.5v5M4.6 5.5c.3 2 2 3 5.15 3" />
     </>
   ),
+  /** Settle：收进 Settled 架子（不归档不删环境） */
+  settle: (
+    <>
+      <path d="M2.75 9.5v2.25a1.5 1.5 0 0 0 1.5 1.5h7.5a1.5 1.5 0 0 0 1.5-1.5V9.5" />
+      <path d="m5.5 6.5 2.25 2.25 3.75-4.5" />
+    </>
+  ),
+  /** Unsettle：从 Settled 架子移回主列表 */
+  unsettle: (
+    <>
+      <path d="M2.75 9.5v2.25a1.5 1.5 0 0 0 1.5 1.5h7.5a1.5 1.5 0 0 0 1.5-1.5V9.5" />
+      <path d="M8 9.25V3m0 0L5.5 5.5M8 3l2.5 2.5" />
+    </>
+  ),
+  /** 复制安全清理命令 */
+  terminal: (
+    <>
+      <rect x="2.25" y="3" width="11.5" height="10" rx="1.75" />
+      <path d="m5.25 6.5 2 1.75-2 1.75M8.75 10h2" />
+    </>
+  ),
 } satisfies Record<string, ReactNode>;
 
 export type GlyphName = keyof typeof PATHS;

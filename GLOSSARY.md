@@ -45,6 +45,10 @@ _Avoid_: needs you、attention
 对话做完了，用户还没看。整行绿色。
 _Avoid_: done-unread
 
+**Settled**:
+用户手动收起的、做完了暂时不用看的对话，排在项目底部的「Settled N」架子里；动作叫 Settle，移回叫 Unsettle。只是本机的显示状态，不是 bb 的归档，不删 worktree 与环境；对话重新运行、有草稿、等你或有新活动就自动回到主列表。
+_Avoid_: 已完结、完结、归档、archive
+
 **速览**:
 一条对话按阶段归并出的全程进展，由模型在每轮结束后写好存盘。
 _Avoid_: recap、摘要、briefing（代码里的叫法）

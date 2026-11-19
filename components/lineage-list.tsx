@@ -33,7 +33,8 @@ import { activityOf, buildConversations, countDescendants, type Conversation } f
 import type { MotionPhase } from "@/lib/motion";
 import { branchLabel, buildLineageTree, collectAncestry, walkThreads, type BranchView } from "@/lib/tree";
 import { matchThreads } from "@/lib/search";
-import { buildProjectView, pathLabels, relativeTime, rollupTone, rowColor, rowTone, toneOf, type ViewNode } from "@/lib/view";
+import { isThreadSettled, needsUserAttention, nextAttentionId, orderByVisual, splitSettledConversations } from "@/lib/settle";
+import { buildProjectView, pathLabels, relativeTime, rollupTone, rowColor, rowTone, toneOf, worktreeCleanupCommand, type RowColor, type ViewNode } from "@/lib/view";
 
 type Thread = PluginSidebarThread;
 /** family: 默认，一个 worktree 一张卡片、按谁派的缩进；lineage: 分支树 */
@@ -50,6 +51,7 @@ interface PluginThreadListProps {
 const POLL_MS = 45_000;
 const STORAGE_VIEW = "worktree-lineage.mode";
 const STORAGE_COLLAPSED = "worktree-lineage.collapsed";
+const STORAGE_SETTLED = "worktree-lineage.settled";
 /** 输入停顿多久才去问 bb 的官方搜索（它搜消息内容，要走服务器） */
 const SEARCH_DEBOUNCE_MS = 260;
 const SEARCH_LIMIT = 8;
@@ -93,6 +95,60 @@ function usePersistentMap(key: string) {
   return [map, set] as const;
 }
 
+/** 本地软收起（Settle）记录：threadId → 完结时间戳；纯插件本地状态，绝不触碰 bb 归档与磁盘工作区 */
+function useSettledMap(key: string) {
+  const [map, setMap] = useState<Record<string, number>>(() => {
+    try {
+      const raw = JSON.parse(localStorage.getItem(key) ?? "{}") as Record<string, unknown>;
+      const clean: Record<string, number> = {};
+      for (const [id, ts] of Object.entries(raw)) if (typeof ts === "number" && Number.isFinite(ts)) clean[id] = ts;
+      return clean;
+    } catch {
+      return {};
+    }
+  });
+  const persist = useCallback(
+    (updater: (prev: Record<string, number>) => Record<string, number>) =>
+      setMap((prev) => {
+        const next = updater(prev);
+        if (next === prev) return prev;
+        try {
+          localStorage.setItem(key, JSON.stringify(next));
+        } catch {
+          // 隐私模式或存储满时忽略持久化失败
+        }
+        return next;
+      }),
+    [key],
+  );
+  const settle = useCallback((id: string) => persist((prev) => ({ ...prev, [id]: Date.now() })), [persist]);
+  const unsettle = useCallback(
+    (id: string) =>
+      persist((prev) => {
+        if (!(id in prev)) return prev;
+        const { [id]: _, ...rest } = prev;
+        return rest;
+      }),
+    [persist],
+  );
+  const prune = useCallback(
+    (dropIds: readonly string[]) =>
+      persist((prev) => {
+        let changed = false;
+        const next = { ...prev };
+        for (const id of dropIds) {
+          if (id in next) {
+            delete next[id];
+            changed = true;
+          }
+        }
+        return changed ? next : prev;
+      }),
+    [persist],
+  );
+  return { settled: map, settle, unsettle, prune };
+}
+
 interface ListContext {
   activeThreadId: string | null;
   onNavigate: () => void;
@@ -107,6 +163,11 @@ interface ListContext {
   isNewGlobal: (threadId: string) => boolean;
   /** 折叠 / 入场 / 退场高度过渡结束后刷新 FLIP 基准坐标 */
   syncPositions: () => void;
+  /** 本地软收起状态与操作（不触发 bb 归档） */
+  settled: Readonly<Record<string, number>>;
+  draftIds: ReadonlySet<string>;
+  settle: (threadId: string) => void;
+  unsettle: (threadId: string) => void;
   threadsById: Map<string, Thread>;
   providersById: Map<string, Provider>;
   childCount: Map<string, number>;
@@ -135,6 +196,7 @@ export function LineageList(props: PluginThreadListProps) {
   const navigate = useBbNavigate();
   const [view, setView] = useState<ViewMode>(() => (localStorage.getItem(STORAGE_VIEW) === "lineage" ? "lineage" : "family"));
   const [collapsed, setCollapsed] = usePersistentMap(STORAGE_COLLAPSED);
+  const { settled, settle: rawSettle, unsettle, prune } = useSettledMap(STORAGE_SETTLED);
   const [focusId, setFocus] = useState<string | null>(null);
 
   const query = useRpcQuery({ contract: serverContract, method: "lineage", input: { refresh: false } });
@@ -363,6 +425,87 @@ export function LineageList(props: PluginThreadListProps) {
     return () => clearTimeout(timer);
   }, []);
 
+  const settle = useCallback(
+    (id: string) => {
+      rawSettle(id);
+      peekClose();
+    },
+    [rawSettle, peekClose],
+  );
+
+  // 自动清理已归档/删除、或因新活动而唤醒的软收起记录，防止 localStorage 堆积或日后意外回落
+  useEffect(() => {
+    const drop: string[] = [];
+    for (const [id, at] of Object.entries(settled)) {
+      const thread = threadsById.get(id);
+      if (!thread) {
+        if (allThreads.length > 0) drop.push(id);
+        continue;
+      }
+      if (!isThreadSettled(thread, at, draftIds.has(id))) drop.push(id);
+    }
+    if (drop.length > 0) prune(drop);
+  }, [settled, threadsById, allThreads.length, draftIds, prune]);
+
+  // 按侧边栏视觉顺序收集“需要你”的对话（黄草稿 / 蓝等你或出错 / 绿完成未读），供 ] / [ 快捷键与顶栏徽标跳转
+  const { attentionIds, topAttentionColor } = useMemo(() => {
+    const ordered: string[] = [];
+    const rank: RowColor[] = ["waiting", "draft", "done"];
+    let best = rank.length;
+    const collect = (thread: Thread) => {
+      const hasDraft = draftIds.has(thread.id);
+      if (!needsUserAttention(thread.indicator, hasDraft)) return;
+      if (isThreadSettled(thread, settled[thread.id], hasDraft)) return;
+      ordered.push(thread.id);
+      const color = rowColor(rowTone(thread.indicator, hasDraft));
+      if (color) best = Math.min(best, rank.indexOf(color));
+    };
+    for (const t of pinned) collect(t);
+    for (const project of projects) {
+      const projectThreads = threads
+        .filter((t) => t.projectId === project.id && !t.isPinned)
+        .sort((a, b) => activityOf(b, toneOf(b.indicator) === "running") - activityOf(a, toneOf(a.indicator) === "running"));
+      for (const t of projectThreads) collect(t);
+    }
+    return { attentionIds: ordered, topAttentionColor: rank[best] ?? null };
+  }, [pinned, projects, threads, draftIds, settled]);
+
+  const jumpAttention = useCallback(
+    (direction: 1 | -1) => {
+      // 两种视图的嵌套、分组与排序都不同：以屏幕上实际渲染出的行序为准，收起分组里的接在后面
+      const rendered = Array.from(rootRef.current?.querySelectorAll("[data-sidebar-thread-id]") ?? [], (el) => el.getAttribute("data-sidebar-thread-id"));
+      const target = nextAttentionId(orderByVisual(attentionIds, rendered), props.activeThreadId, direction);
+      if (!target) return;
+      navigate.toThread(target);
+      props.onNavigate();
+      requestAnimationFrame(() => {
+        rootRef.current?.querySelector(`[data-sidebar-thread-id="${CSS.escape(target)}"]`)?.closest(".wl-cell")?.scrollIntoView({ block: "nearest", behavior: "smooth" });
+      });
+    },
+    [attentionIds, props.activeThreadId, navigate, props.onNavigate],
+  );
+
+  // 快捷键在需要你的对话间前后循环跳转：
+  // - 裸键 ] / [：焦点不在输入框或编辑器里时才生效，打字时不抢
+  // - Alt/Option + ] / [：任何地方都生效。bb 打开对话后焦点会落进输入框，只靠裸键跳一次之后就按不动了；
+  //   按物理键位（event.code）判断，因为 macOS 上 Option 会把 ] 变成别的字符。bb 自己用的是 Cmd / Ctrl+Shift + 方括号，不冲突
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if (event.metaKey || event.ctrlKey || event.defaultPrevented || event.isComposing) return;
+      const bare = !event.altKey && (event.key === "]" || event.key === "[");
+      const withAlt = event.altKey && !event.shiftKey && (event.code === "BracketRight" || event.code === "BracketLeft");
+      if (!bare && !withAlt) return;
+      const target = event.target as HTMLElement | null;
+      if (bare && target && (target.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName))) return;
+      if (!rootRef.current || rootRef.current.offsetParent === null) return;
+      if (attentionIds.length === 0) return;
+      event.preventDefault();
+      jumpAttention(event.key === "]" || event.code === "BracketRight" ? 1 : -1);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [attentionIds.length, jumpAttention]);
+
   // 区分“全新对话”和“从别区搬来的对话（置顶/取消置顶）”：knownIdsRef 在 commit 后更新，渲染期始终保存上一帧的全集
   const activeIds = useMemo(() => new Set(threads.map((t) => t.id)), [threads]);
   const knownIdsRef = useRef<Set<string> | null>(null);
@@ -372,18 +515,19 @@ export function LineageList(props: PluginThreadListProps) {
   const isRelocated = useCallback((id: string) => activeIds.has(id), [activeIds]);
   const isNewGlobal = useCallback((id: string) => knownIdsRef.current !== null && !knownIdsRef.current.has(id), []);
 
-  // 顺序 / 归属签名：仅当置顶、项目归属、父子关系、分支路径或排序时间戳变动时才运行 FLIP
+  // 顺序 / 归属签名：仅当置顶、软收起、项目归属、父子关系、分支路径或排序时间戳变动时才运行 FLIP
   const placementSig = useMemo(() => {
     if (filtering) return "filter";
     const pinPart = pinned.map((t) => t.id).join(",");
+    const settledPart = Object.keys(settled).sort().join(",");
     const orderPart = threads
       .map((t) => {
         const running = toneOf(t.indicator) === "running";
         return `${t.projectId ?? ""}:${t.isPinned ? 1 : 0}:${t.pinSortKey ?? ""}:${t.parentThreadId ?? ""}:${t.environment?.path ?? ""}:${activityOf(t, running)}:${t.id}`;
       })
       .join("|");
-    return `${view}#${pinPart}#${orderPart}#${query.data?.generatedAt ?? 0}`;
-  }, [filtering, view, pinned, threads, query.data?.generatedAt]);
+    return `${view}#${pinPart}#${settledPart}#${orderPart}#${query.data?.generatedAt ?? 0}`;
+  }, [filtering, view, pinned, settled, threads, query.data?.generatedAt]);
 
   const { syncPositions } = useFlipContainer(rootRef, {
     enabled: ready && !filtering,
@@ -402,6 +546,10 @@ export function LineageList(props: PluginThreadListProps) {
     isRelocated,
     isNewGlobal,
     syncPositions,
+    settled,
+    draftIds,
+    settle,
+    unsettle,
     threadsById,
     providersById,
     childCount,
@@ -485,6 +633,19 @@ export function LineageList(props: PluginThreadListProps) {
               {focusId ? (
                 <button type="button" className="wl-clear" onClick={() => setFocus(null)}>
                   取消高亮
+                </button>
+              ) : null}
+              {attentionIds.length > 0 && topAttentionColor ? (
+                <button
+                  type="button"
+                  className="wl-attn"
+                  data-yours={topAttentionColor}
+                  aria-label={`跳到下一个需要我的对话（共 ${attentionIds.length} 条）`}
+                  title={`跳到下一个需要我的对话（共 ${attentionIds.length} 条；按 ] / [ 循环切换，在输入框里用 Alt/Option + ] / [）`}
+                  onClick={() => jumpAttention(1)}
+                >
+                  <span className="wl-attn-dot" />
+                  {attentionIds.length}
                 </button>
               ) : null}
               <button type="button" className="wl-btn" aria-label="筛选" title="筛选对话、分支、项目（按 / ）" onClick={() => setSearching(true)}>
@@ -745,6 +906,8 @@ function Section({
 interface ProjectActions {
   projectId: string;
   defaultBranch: string | null;
+  /** 仓库主检出的路径（清理命令的 git -C 用） */
+  repoPath: string | null;
   canStartIn: (node: BranchView<Thread>) => boolean;
   startIn: (node: BranchView<Thread>) => void;
 }
@@ -752,6 +915,12 @@ interface ProjectActions {
 const EMPTY_CONVERSATIONS: Conversation<Thread>[] = [];
 const EMPTY_NODES: ViewNode<Thread>[] = [];
 const EMPTY_LOOSE: { thread: Thread }[] = [];
+
+function hasThreadInConversation(item: Conversation<Thread>, id: string | null): boolean {
+  if (!id) return false;
+  if (item.thread.id === id) return true;
+  return item.children.some((child) => hasThreadInConversation(child, id));
+}
 
 function ProjectSection({
   projectId,
@@ -778,10 +947,25 @@ function ProjectSection({
     () => (projectView ? null : buildConversations(threads, (t) => toneOf(t.indicator) === "running")),
     [projectView, threads],
   );
-  const convPresence = usePresenceList(conversations ?? EMPTY_CONVERSATIONS, (item) => item.thread.id, {
-    enabled: list.ready && conversations !== null,
+  const split = useMemo(
+    () => (conversations ? splitSettledConversations(conversations, list.settled, list.draftIds) : null),
+    [conversations, list.settled, list.draftIds],
+  );
+  const settledRootIds = useMemo(() => new Set((split?.settled ?? EMPTY_CONVERSATIONS).map((c) => c.thread.id)), [split]);
+  const settledHoldsActive = useMemo(
+    () => (split?.settled ?? EMPTY_CONVERSATIONS).some((c) => hasThreadInConversation(c, list.activeThreadId)),
+    [split, list.activeThreadId],
+  );
+  const settledOpen = list.isOpen(`settled:${projectId}`, settledHoldsActive);
+  // 软收进 Settled 折叠架时：架子合着就播平滑收起退场，架子开着就走 FLIP 滑进去
+  const isActiveConvRelocated = useCallback(
+    (id: string) => list.isRelocated(id) && (!settledRootIds.has(id) || settledOpen),
+    [list, settledRootIds, settledOpen],
+  );
+  const convPresence = usePresenceList(split?.active ?? EMPTY_CONVERSATIONS, (item) => item.thread.id, {
+    enabled: list.ready && split !== null,
     resetKey: `${list.view}:${projectView ? "tree" : "conv"}`,
-    isRelocated: list.isRelocated,
+    isRelocated: isActiveConvRelocated,
     isNewGlobal: list.isNewGlobal,
   });
   const rootsPresence = usePresenceList(projectView?.roots ?? EMPTY_NODES, (node) => node.key, {
@@ -801,6 +985,7 @@ function ProjectSection({
     return {
       projectId,
       defaultBranch: scan?.defaultBranch ?? null,
+      repoPath: lineage?.sourcePath ?? null,
       canStartIn: (node) => envIdOf(node) !== undefined,
       startIn: (node) => {
         const environmentId = envIdOf(node);
@@ -823,7 +1008,7 @@ function ProjectSection({
       sectionKey={`project:${projectId}`}
       flipId={`section:project:${projectId}`}
       title={name}
-      count={threads.length}
+      count={split ? split.active.reduce((sum, item) => sum + 1 + countDescendants(item), 0) : threads.length}
       note={note}
       action={
         <button
@@ -840,18 +1025,23 @@ function ProjectSection({
         </button>
       }
     >
-      {conversations ? (
-        <ul className="wl-tree">
-          {convPresence.entries.map((entry) => (
-            <ConversationItem
-              key={entry.key}
-              item={entry.item}
-              phase={entry.phase}
-              onEntered={() => convPresence.markEntered(entry.key)}
-              onExited={() => convPresence.markExited(entry.key)}
-            />
-          ))}
-        </ul>
+      {split ? (
+        <>
+          {convPresence.entries.length > 0 ? (
+            <ul className="wl-tree">
+              {convPresence.entries.map((entry) => (
+                <ConversationItem
+                  key={entry.key}
+                  item={entry.item}
+                  phase={entry.phase}
+                  onEntered={() => convPresence.markEntered(entry.key)}
+                  onExited={() => convPresence.markExited(entry.key)}
+                />
+              ))}
+            </ul>
+          ) : null}
+          <SettledFoot projectId={projectId} items={split.settled} open={settledOpen} holdsActive={settledHoldsActive} />
+        </>
       ) : projectView ? (
         <>
           <ul className="wl-tree">
@@ -969,6 +1159,14 @@ function BranchItem({
   const tone = rollupTone(threads.map((t) => t.indicator));
   const dim = list.focusSet !== null && !threads.some((t) => list.focusSet!.has(t.id));
   const startHere = node.worktreePath ? { run: () => actions.startIn(node), known: actions.canStartIn(node) } : undefined;
+  // 只给 bb 之外的、空闲或已合回的非主 worktree：
+  // - 里面还有对话在跑 / 等你 / 出错时不给，免得把正在用的 worktree 删掉
+  // - bb 登记过的环境（canStartIn）不给：它的生命周期归 bb 管（归档对话时 bb 自己删），绕过 bb 用 git 删会留下悬空的环境记录
+  const busy = threads.some((t) => toneOf(t.indicator) !== null && toneOf(t.indicator) !== "done");
+  const cleanupCmd =
+    node.worktreePath && !node.isMain && !busy && !actions.canStartIn(node) && (quiet || node.merged || threads.length === 0)
+      ? worktreeCleanupCommand({ repoPath: actions.repoPath, worktreePath: node.worktreePath, branch: node.branch, merged: node.merged })
+      : null;
   const labels = pathLabels(view.via, node);
   const leaf = labels.pop()!;
   const tags = branchTags(node);
@@ -990,6 +1188,7 @@ function BranchItem({
           {leaf}
         </span>
         {tags.length > 0 ? <span className="wl-btags">{tags.join(" · ")}</span> : null}
+        {cleanupCmd && !exiting ? <CopyCleanupButton command={cleanupCmd} /> : null}
         {startHere && !exiting ? <StartHereButton {...startHere} reveal /> : null}
         {hasKids && !exiting ? <FoldButton open={open} hidden={hidden} toggle={() => list.toggle(key)} /> : null}
       </div>
@@ -1047,6 +1246,76 @@ function StartHereButton({ run, known, reveal = false }: { run: () => void; know
   );
 }
 
+/** 复制空闲 / 已合回 worktree 的安全清理命令（绝不自动删目录） */
+function CopyCleanupButton({ command }: { command: string }) {
+  const [copied, setCopied] = useState(false);
+  const timerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  useEffect(() => () => clearTimeout(timerRef.current), []);
+  return (
+    <button
+      type="button"
+      className="wl-btn wl-reveal"
+      data-copied={copied || undefined}
+      aria-label="复制安全清理命令"
+      title={copied ? `已复制：${command}` : `复制安全清理命令（不自动删除）：\n${command}`}
+      onClick={() => {
+        void copyToClipboard({ text: command });
+        setCopied(true);
+        clearTimeout(timerRef.current);
+        timerRef.current = setTimeout(() => setCopied(false), 1600);
+      }}
+    >
+      <Glyph name={copied ? "check" : "terminal"} size={12} />
+    </button>
+  );
+}
+
+/** 对话视图的 Settled 架子：做完了但不想触发 bb 归档（不删托管环境）的对话收在这里，随时可恢复 */
+function SettledFoot({
+  projectId,
+  items,
+  open,
+  holdsActive,
+}: {
+  projectId: string;
+  items: Conversation<Thread>[];
+  open: boolean;
+  holdsActive: boolean;
+}) {
+  const list = useList();
+  const key = `settled:${projectId}`;
+  const presence = usePresenceList(items, (item) => item.thread.id, {
+    enabled: list.ready && open,
+    resetKey: list.view,
+    isRelocated: list.isRelocated,
+    isNewGlobal: list.isNewGlobal,
+  });
+  if (items.length === 0 && presence.entries.length === 0) return null;
+
+  return (
+    <div>
+      <button type="button" className="wl-foot" data-open={open} aria-expanded={open} onClick={() => list.toggle(key, holdsActive)}>
+        <Glyph name="chevron" size={9} className="wl-chev" />
+        <span>Settled {items.length}</span>
+      </button>
+      <Collapse open={open}>
+        <ul className="wl-tree">
+          {presence.entries.map((entry) => (
+            <ConversationItem
+              key={entry.key}
+              item={entry.item}
+              settled
+              phase={entry.phase}
+              onEntered={() => presence.markEntered(entry.key)}
+              onExited={() => presence.markExited(entry.key)}
+            />
+          ))}
+        </ul>
+      </Collapse>
+    </div>
+  );
+}
+
 /** 收起时常显并带上被收起的对话数；展开时只在悬停出现 */
 function FoldButton({ open, hidden, toggle }: { open: boolean; hidden: number; toggle: () => void }) {
   return (
@@ -1099,12 +1368,14 @@ function ProjectFoot({ merged, idle, actions }: { merged: BranchView<Thread>[]; 
 function ConversationItem({
   item,
   depth = 0,
+  settled = false,
   phase = "present",
   onEntered,
   onExited,
 }: {
   item: Conversation<Thread>;
   depth?: number;
+  settled?: boolean;
   phase?: MotionPhase;
   onEntered?: () => void;
   onExited?: () => void;
@@ -1126,9 +1397,18 @@ function ConversationItem({
   const total = countDescendants(item);
   // 默认展开：派出的对话是这一家正在做的事，收起是用户自己的选择
   const open = list.isOpen(key);
+  // 只有对话视图顶层允许整家 Settle / Unsettle（子对话随父对话一起收放）
+  const settleAction =
+    depth === 0 && !exiting
+      ? settled
+        ? { mode: "unsettle" as const, run: () => list.unsettle(item.thread.id) }
+        : { mode: "settle" as const, run: () => list.settle(item.thread.id) }
+      : undefined;
   return (
     <ThreadCell
       thread={item.thread}
+      quiet={settled}
+      settleAction={settleAction}
       phase={phase}
       onEntered={onEntered}
       onExited={onExited}
@@ -1142,6 +1422,7 @@ function ConversationItem({
                 key={entry.key}
                 item={entry.item}
                 depth={depth + 1}
+                settled={settled}
                 phase={exiting ? "present" : entry.phase}
                 onEntered={() => childPresence.markEntered(entry.key)}
                 onExited={() => childPresence.markExited(entry.key)}
@@ -1163,13 +1444,17 @@ function Collapse({ open, children }: { open: boolean; children: ReactNode }) {
   const list = useList();
   const [mounted, setMounted] = useState(open);
   const [settled, setSettled] = useState(open);
-  const prevOpen = useRef(open);
-  if (open !== prevOpen.current) {
-    prevOpen.current = open;
+  // “上一次的 open”放在 state 里而不是 ref：渲染被 React 丢弃时 state 会一起回滚，ref 不会，
+  // 用 ref 会出现“已展开但内容没挂载”的空架子（实测连点页脚 + 切视图时出现过）
+  const [prevOpen, setPrevOpen] = useState(open);
+  if (open !== prevOpen) {
+    setPrevOpen(open);
     if (open && !mounted) setMounted(true);
     if (settled) setSettled(false);
   }
   useEffect(() => {
+    // 兜底：只要是展开的就保证内容已挂载
+    if (open) setMounted(true);
     if (reducedMotion()) {
       setMounted(open);
       setSettled(open);
@@ -1209,12 +1494,31 @@ function actionTarget(thread: Thread) {
 }
 
 /** 悬停时出现在标题行右端的快捷操作。只在行第一次被悬停后才挂载，避免每一行都订阅操作列表 */
-function QuickActions({ thread, startHere }: { thread: Thread; startHere?: { run: () => void; known: boolean } }) {
+function QuickActions({
+  thread,
+  startHere,
+  settleAction,
+}: {
+  thread: Thread;
+  startHere?: { run: () => void; known: boolean };
+  settleAction?: { mode: "settle" | "unsettle"; run: () => void };
+}) {
   const target = actionTarget(thread);
   const entries = useThreadActions(target, { keys: QUICK_ACTIONS });
   return (
     <span className="wl-actions">
       {startHere ? <StartHereButton {...startHere} /> : null}
+      {settleAction ? (
+        <button
+          type="button"
+          className="wl-btn"
+          aria-label={settleAction.mode === "settle" ? "Settle" : "Unsettle"}
+          title={settleAction.mode === "settle" ? "Settle（收进 Settled，不归档不删环境）" : "Unsettle（移回主列表）"}
+          onClick={settleAction.run}
+        >
+          <Glyph name={settleAction.mode} size={13} />
+        </button>
+      ) : null}
       {entries
         .filter((entry) => entry.action.choices === undefined)
         .map((entry) => (
@@ -1260,10 +1564,12 @@ function ThreadCell({
   thread,
   sub,
   secondary = false,
+  quiet = false,
   fold,
   focusChip = false,
   origin: showOrigin = false,
   startHere,
+  settleAction,
   phase = "present",
   forceStaticTitle = false,
   onEntered,
@@ -1275,10 +1581,12 @@ function ThreadCell({
   children?: ReactNode;
   sub?: ReactNode;
   secondary?: boolean;
+  quiet?: boolean;
   fold?: { count: number; open: boolean; toggle: () => void };
   focusChip?: boolean;
   origin?: boolean;
   startHere?: { run: () => void; known: boolean };
+  settleAction?: { mode: "settle" | "unsettle"; run: () => void };
   phase?: MotionPhase;
   forceStaticTitle?: boolean;
   onEntered?: () => void;
@@ -1317,6 +1625,12 @@ function ThreadCell({
     return () => clearTimeout(timer);
   }, [tone]);
 
+  // 只有空闲或完成未读（且未置顶）的对话才展示 Settle 按钮；Settled 架子里的对话始终展示 Unsettle
+  const effectiveSettle =
+    settleAction && (settleAction.mode === "unsettle" || (!thread.isPinned && (tone === null || tone === "done")))
+      ? settleAction
+      : undefined;
+
   return (
     <MotionRow
       phase={phase}
@@ -1329,7 +1643,8 @@ function ThreadCell({
         <div
           className={arrive ? "wl-cell wl-arrive" : "wl-cell"}
           data-tone={tone ?? undefined}
-          data-yours={rowColor(tone) ?? undefined}
+          data-yours={!quiet ? rowColor(tone) ?? undefined : undefined}
+          data-quiet={quiet || undefined}
           data-flash={flash || undefined}
           data-selected={list.selectedId === thread.id || undefined}
           data-lines={sub !== undefined ? 2 : 1}
@@ -1412,7 +1727,7 @@ function ThreadCell({
             ) : null}
             <span className="wl-tail">
               <span className="wl-slot">{showGlyph ? <ThreadStatusGlyph indicator={indicator} rowStatus={rowStatus} size="compact" /> : time}</span>
-              {hot && !list.compact && !exiting ? <QuickActions thread={thread} startHere={startHere} /> : null}
+              {hot && !list.compact && !exiting ? <QuickActions thread={thread} startHere={startHere} settleAction={effectiveSettle} /> : null}
             </span>
           </div>
           {sub !== undefined ? <div className="wl-line2">{sub}</div> : null}

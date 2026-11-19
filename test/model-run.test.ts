@@ -71,10 +71,10 @@ describe("runGateway", () => {
     expect(result).toMatchObject({ status: "ok", text: '{"about":"x"}' });
   });
 
-  it("429（如免费额度用完）返回 failed，带上网关的错误信息和按 Retry-After 算的模型级冷却", async () => {
+  it("429（如免费额度用完）返回 failed，带上网关的错误信息和按 Retry-After 夹到上限的模型级冷却", async () => {
     const base = await fakeGateway((_req, _body, res) => json(res, 429, { error: { message: "Free usage limit reached", type: "rate_limit_error" } }, { "retry-after": "3595" }));
     const result = await runGateway({ via: "gateway", baseUrl: base, model: MODEL }, "s", "p");
-    expect(result).toEqual({ status: "failed", message: "网关 HTTP 429: Free usage limit reached", cooldown: { scope: "model", ms: 3_595_000 } });
+    expect(result).toEqual({ status: "failed", message: "网关 HTTP 429: Free usage limit reached", cooldown: { scope: "model", ms: 25 * 60_000 } });
   });
 
   it("429 没带 Retry-After：默认冷却 15 分钟", async () => {
@@ -138,10 +138,11 @@ describe("Retry-After", () => {
     expect(parseRetryAfter("soon", now)).toBeNull();
     expect(parseRetryAfter("-5", now)).toBeNull();
   });
-  it("冷却时长：缺省 15 分钟，最多 2 小时", () => {
+  it("冷却时长：缺省 15 分钟，最多 25 分钟", () => {
     expect(rateLimitCooldownMs(null, now)).toBe(15 * 60_000);
     expect(rateLimitCooldownMs("garbage", now)).toBe(15 * 60_000);
-    expect(rateLimitCooldownMs("3595", now)).toBe(3_595_000);
-    expect(rateLimitCooldownMs("86400", now)).toBe(2 * 60 * 60_000);
+    expect(rateLimitCooldownMs("600", now)).toBe(600_000);
+    expect(rateLimitCooldownMs("3595", now)).toBe(25 * 60_000);
+    expect(rateLimitCooldownMs("86400", now)).toBe(25 * 60_000);
   });
 });

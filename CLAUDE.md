@@ -2,13 +2,13 @@
 TypeScript 5.7 + React 19 + @get-bb/plugin-sdk 0.6.132 + zod 4 + vitest 3（bb ≥ 0.49）
 
 <directory>
-lib/: 契约与纯逻辑，关键文件: contract.ts（三端数据契约）、lineage.ts（分支血缘推断，纯函数）、git-scan.ts（host 端读 git）、tree.ts（对话挂到血缘树）、conversations.ts（对话视图的模型）、view.ts（分支树视图的模型）、briefing.ts（全程速览的提要、提示词与输出校验，纯函数）、model-run.ts（host 端调模型：本机网关一次 HTTP（429 / 连不上时给出冷却建议），或一次性的本机 claude）、motion.ts（列表入场/退场状态机与嵌套抵消 FLIP 纯函数）
+lib/: 契约与纯逻辑，关键文件: contract.ts（三端数据契约）、lineage.ts（分支血缘推断，纯函数）、git-scan.ts（host 端读 git）、tree.ts（对话挂到血缘树）、conversations.ts（对话视图的模型）、view.ts（分支树视图的模型 + 安全清理命令生成）、settle.ts（本地 Settle 软收起判定与智能唤醒、待办按屏幕行序循环跳转）、briefing.ts（全程速览的提要、提示词与输出校验，纯函数）、model-run.ts（host 端调模型：本机网关一次 HTTP（429 最多冷却 25 分钟 / 连不上冷却 60 秒），或一次性的本机 claude）、motion.ts（列表入场/退场状态机与嵌套抵消 FLIP 纯函数）
 components/: 侧边栏界面，关键文件: lineage-list.tsx、motion.tsx（存在感列表与全局 FLIP 滑移）、peek.tsx（悬停速览卡）、icons.tsx（自绘图标）；ui/icon.tsx 为 SDK 图标的薄封装
 styles.css: 全部视觉（wl- 前缀类）。两个视图各有主角：对话视图一条对话一行、不出现分支；分支树视图分支是主行、对话是次级行。对齐只有一条规则：下一级的图标对齐上一级文字的左缘（一级 = 23px，层数由组件写在 --wl-depth 上）；行尾是固定宽度的槽，所有行的右边线对齐；全列表没有双行（搜索结果除外）。新加 CSS 变量前先 grep，避免重名（--wl-row 是行高）。颜色只用宿主主题变量（--ink / --sidebar / --primary / 语义色），禁止颜色字面量，以跟随任意主题；整个侧边栏光标一律为箭头（含按钮与对话行），唯一的例外是悬停卡片：里面的文字可以选中复制，所以是文字光标；颜色即含义，整行底色三种：黄 = 输入框里有没发出去的草稿，蓝 = 它停下来等你（等你回复或出错，行尾标记区分两者），绿 = 做完了你还没看，规则在 lib/view.ts 的 rowTone / rowColor（底色的 CSS 变量叫 --wl-hue；--wl-row 是行高，撞过一次名）；“等你”在悬停卡片和 session-cockpit 的 Progress 分区里也用同一种蓝；圆角只用 bb 设计系统的三档（由主题 --radius 推出：sm 4px 小按钮 / md 6px 行、菜单、输入框 / lg 8px 卡片），不写别的数值；圆点与圆形标记（999px）不在此限
 test/: vitest 用例；git-scan.test.ts 会在系统临时目录建真实 git 仓库；model-run.test.ts 在 127.0.0.1 随机端口起假网关；briefings.test.ts 用假 callModel 与假时钟测网关模型链回退、冷却与过期恢复
 host.ts: host 入口，在每台机器上执行 scanLineage（只读 git）与 writeBriefing（按 route 走本机网关 HTTP 或一次性的本机 claude，一次只走一条）
 server.ts: 服务端，汇总 bb 项目源 / 环境记录的起点分支，调度 host，15s 缓存；定义速览的四项设置并接线（briefingEnabled 开关、briefingGatewayUrl 网关地址默认 http://127.0.0.1:3425、briefingGatewayModel 逗号分隔的有序网关模型列表默认 "workbuddy/deepseek-v4.1-flash, opencode-zen/deepseek-v4.1-flash-free"、briefingModel 兜底的 claude 模型默认 haiku）
-briefings.ts: 服务端的速览调度：thread.idle 时把对话排进队列，一次写一条，结果存 bb.storage.kv（键 briefing:<threadId>）；每条按顺序试网关上的模型链，某个模型失败或输出过不了 parseBriefing 就试下一个，全不行再兜底本机 claude（generateBriefing）；429 的模型按 Retry-After 冷却（缺省 15 分钟、最多 2 小时），网关连不上整体冷却 60 秒，冷却表在内存里按 机器 + 网关 + 模型 记，冷却中的直接跳过；日志写明命中的 via gateway <模型> / via claude <模型> (fallback)、每个失败的模型（warn）与冷却中跳过的模型（附在结果行，不单独 warn）；启动时为最近 14 天活跃的对话补写（最多 40 条）；每天上限 300 次，连续失败 3 次（网关与 claude 都失败才算一次）清空队列
+briefings.ts: 服务端的速览调度：thread.idle 时把对话排进队列，一次写一条，结果存 bb.storage.kv（键 briefing:<threadId>）；每条按顺序试网关上的模型链，某个模型失败或输出过不了 parseBriefing 就试下一个，全不行再兜底本机 claude（generateBriefing）；429 的模型按 Retry-After 冷却（缺省 15 分钟、最多 25 分钟），网关连不上整体冷却 60 秒，冷却表在内存里按 机器 + 网关 + 模型 记，冷却中的直接跳过；日志写明命中的 via gateway <模型> / via claude <模型> (fallback)、每个失败的模型（warn）与冷却中跳过的模型（附在结果行，不单独 warn）；启动时为最近 14 天活跃的对话补写（最多 40 条）；每天上限 300 次，连续失败 3 次（网关与 claude 都失败才算一次）清空队列
 app.tsx: 前端入口，导入 styles.css，注册 experimental_threadList 槽位 "lineage"
 </directory>
 

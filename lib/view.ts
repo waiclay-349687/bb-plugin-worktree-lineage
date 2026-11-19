@@ -150,3 +150,20 @@ export function relativeTime(at: number, now: number): string {
   const days = Math.floor(hours / 24);
   return days < 14 ? `${days}d` : `${Math.floor(days / 7)}w`;
 }
+
+/** POSIX 单引号安全转义：仅在包含空格或特殊字符时加引号 */
+function shellArg(value: string): string {
+  if (/^[A-Za-z0-9_./:@%+=,-]+$/.test(value)) return value;
+  return `'${value.replace(/'/g, "'\\''")}'`;
+}
+
+/**
+ * 为空闲或已合回的非主 worktree 生成安全清理命令（绝不带 --force 或 -D，有未提交改动或未合回提交时 git 会拒绝并保护现场）。
+ * 带上 -C <仓库主检出>：命令贴进任何目录的终端都能执行，不依赖当前目录恰好在仓库里；拿不到仓库路径时省略。
+ */
+export function worktreeCleanupCommand(input: { repoPath: string | null; worktreePath: string; branch: string | null; merged: boolean }): string {
+  const git = input.repoPath ? `git -C ${shellArg(input.repoPath)}` : "git";
+  const remove = `${git} worktree remove ${shellArg(input.worktreePath)}`;
+  if (input.merged && input.branch) return `${remove} && ${git} branch -d ${shellArg(input.branch)}`;
+  return remove;
+}

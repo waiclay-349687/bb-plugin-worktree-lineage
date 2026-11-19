@@ -216,7 +216,7 @@ function PeekCard({ target, view, hover, closing }: { target: PeekTarget; view: 
   const pullRequest = envId ? pr.data?.[envId]?.pullRequest : undefined;
   const branch = target.branch ?? (target.detached ? "分离 HEAD" : null);
   const path = describePath(thread.environment?.path ?? null);
-  const scope = typeof __BB_PLUGIN_ID__ === "string" ? { "data-bb-plugin": __BB_PLUGIN_ID__ } : {};
+  const pluginId = typeof __BB_PLUGIN_ID__ === "string" ? __BB_PLUGIN_ID__ : "worktree-lineage";
 
   // 进展：一行里能说清的事实，逐项拼起来；空闲的不值得占字
   const progress: string[] = [];
@@ -245,7 +245,7 @@ function PeekCard({ target, view, hover, closing }: { target: PeekTarget; view: 
       style={{ top: box?.top ?? target.top, left: target.left, height: box?.height }}
       data-bb-portaled-overlay=""
       data-bb-plugin-root=""
-      {...scope}
+      data-bb-plugin={pluginId}
     >
       <div className="wl-peek-ghost" ref={ghost} aria-hidden="true" />
       <div className="wl-peek-body" ref={body}>

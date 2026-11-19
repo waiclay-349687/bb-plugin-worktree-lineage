@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { BranchNode, RepoScan } from "../lib/contract";
 import { buildLineageTree, type ThreadLike } from "../lib/tree";
-import { buildProjectView, pathLabels, relativeTime, rollupTone, rowColor, rowTone, toneOf, type ViewNode } from "../lib/view";
+import { buildProjectView, pathLabels, relativeTime, rollupTone, rowColor, rowTone, toneOf, worktreeCleanupCommand, type ViewNode } from "../lib/view";
 
 const branch = (name: string, parent: string | null, extra: Partial<BranchNode> = {}): BranchNode => ({
   name,
@@ -166,5 +166,25 @@ describe("rowTone", () => {
     expect([rowColor("attention"), rowColor("error")]).toEqual(["waiting", "waiting"]);
     expect(rowColor("done")).toBe("done");
     expect([rowColor("running"), rowColor(null)]).toEqual([null, null]);
+  });
+});
+
+describe("worktreeCleanupCommand", () => {
+  it("空闲 worktree 生成不带 --force 的安全移除命令，并用 -C 指向仓库主检出", () => {
+    expect(worktreeCleanupCommand({ repoPath: "/tmp/repo", worktreePath: "/tmp/wt/feat-a", branch: "feat-a", merged: false })).toBe(
+      "git -C /tmp/repo worktree remove /tmp/wt/feat-a",
+    );
+  });
+
+  it("已合回分支额外附带小写 -d 安全删分支，含空格或引号的路径用单引号转义", () => {
+    expect(worktreeCleanupCommand({ repoPath: "/tmp/my repo", worktreePath: "/tmp/it's wt/feat-a", branch: "feat/a", merged: true })).toBe(
+      "git -C '/tmp/my repo' worktree remove '/tmp/it'\\''s wt/feat-a' && git -C '/tmp/my repo' branch -d feat/a",
+    );
+  });
+
+  it("拿不到仓库路径时省略 -C；从不出现 --force 或大写 -D", () => {
+    const command = worktreeCleanupCommand({ repoPath: null, worktreePath: "/tmp/wt/x", branch: "x", merged: true });
+    expect(command).toBe("git worktree remove /tmp/wt/x && git branch -d x");
+    expect(command).not.toMatch(/--force|-D\b|-f\b/);
   });
 });
