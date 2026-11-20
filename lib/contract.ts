@@ -317,7 +317,8 @@ export const serverContract = defineRpcContract({
    * status 说明结果，调用方据此按自己的语言提示：written / disabled / empty / unavailable / limit / failed（error 是英文原因，只供日志）。
    */
   regenerateBriefing: {
-    input: z.object({ threadId: z.string().min(1) }),
+    /** language：这一次用什么语言写（session-cockpit 传 Progress 板块的有效语言）；给了就同时写进 briefingLanguage 设置 */
+    input: z.object({ threadId: z.string().min(1), language: z.enum(["en", "zh"]).optional() }),
     output: regenerateResultSchema,
   },
   /** 前端报告它解析出的界面语言（设置为 auto 时由浏览器语言决定）；服务端据此决定 auto 模式下速览用哪种语言 */

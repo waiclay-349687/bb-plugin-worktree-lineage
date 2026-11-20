@@ -289,7 +289,14 @@ export default async function plugin(bb: BbPluginApi) {
       return settingsStatus();
     },
     briefingConfig: () => briefingConfig(),
-    regenerateBriefing: ({ threadId }) => briefings.regenerate(threadId),
+    regenerateBriefing: async ({ threadId, language }) => {
+      // 指定了语言（Progress 板块的有效语言）且与当前速览语言设置不同：先写进设置，之后后台写的速览也用它，不会被改回去
+      if (language) {
+        const values = await readSettings();
+        if (values.briefingLanguage !== language) await settings.experimental_set({ briefingLanguage: language });
+      }
+      return briefings.regenerate(threadId, language);
+    },
     setBriefingConfig: async (input) => {
       await applyPatch(briefingConfigToPatch(input));
       return briefingConfig();

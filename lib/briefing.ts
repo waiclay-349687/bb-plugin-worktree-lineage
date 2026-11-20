@@ -39,7 +39,7 @@ export type BriefingStage = Briefing["stages"][number];
  * 存盘的速览。
  * - outlineKey: 写的时候对话大纲的指纹，用来判断之后有没有新消息（新要求、新答复、子对话回报都算）
  * - askCount:   写的时候读到第几条要求，只用来说“落后了几轮”
- * - language:   用哪种语言写的；加这个字段之前存的都是中文，缺省按 zh 算。语言和当前界面不一致就算落后（要重写），也不拿出来显示
+ * - language:   用哪种语言写的；加这个字段之前存的都是中文，缺省按 zh 算。与当前速览语言不一致时后台会重写，但显示照旧（不论语言都原样给出）
  */
 export const storedBriefingSchema = briefingSchema.extend({
   version: z.number(),

@@ -145,7 +145,7 @@ git -C <main checkout> worktree remove <path> && git -C <main checkout> branch -
 
 Change them in bb's plugin settings, or from the CLI. Changing `language` takes effect immediately:
 - Whichever language you pick, the whole interface uses only that language. That covers buttons, tags, times (`5m` / `5分钟`), tooltips and the hover card. In Chinese, Settle becomes 搁置 and Settled becomes 已搁置.
-- Briefings are rewritten in the new language. Until then, a card shows only the recap, never text in the other language.
+- Briefings are rewritten in the new briefing language in the background. Until then the existing briefing stays visible in full, in whatever language it was written; the hover card and Session Cockpit's Progress always show the same briefing.
 - The settings page itself is rendered by bb and stays in English.
 
 ```sh
@@ -176,7 +176,7 @@ Changes apply immediately, also to the sidebar on the same page.
 Other plugins can call these RPCs with plugin id `worktree-lineage`:
 
 - `briefing({ threadId })`: the saved briefing for a thread, including `briefing.language` (`"en"` or `"zh"`).
-- `regenerateBriefing({ threadId })` rewrites that thread's briefing now with the current settings, even if it is up to date, and returns `{ ok, status, briefing, error? }`. `status` is one of `written`, `disabled`, `empty`, `unavailable`, `limit` or `failed`. Concurrent calls for the same thread share one run.
+- `regenerateBriefing({ threadId, language? })` rewrites that thread's briefing now (in `language` if given, which is also saved as the briefing language) with the current settings, even if it is up to date, and returns `{ ok, status, briefing, error? }`. `status` is one of `written`, `disabled`, `empty`, `unavailable`, `limit` or `failed`. Concurrent calls for the same thread share one run.
 - `briefingConfig()` returns `{ enabled, language, gatewayUrl, gatewayModel, fallbackModel, systemPrompt, defaultSystemPromptEn, defaultSystemPromptZh, dailyLimit, todayCount, resolvedLanguage }`.
 - `setBriefingConfig({ enabled?, language?, gatewayUrl?, gatewayModel?, fallbackModel?, systemPrompt?, dailyLimit?, resetTodayCount?, clearCooldowns? })` writes the same settings, or runs the reset or clear action, and returns the updated `briefingConfig`.
 

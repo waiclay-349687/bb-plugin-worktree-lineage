@@ -121,6 +121,34 @@ describe("regenerate（手动重新生成速览）", () => {
   });
 });
 
+describe("跨语言显示：悬停卡片与 Progress 同一份速览", () => {
+  const zhBriefing = { about: "给侧边栏加登录页", stages: [{ title: "做表单", state: "done", note: "测试已通过" }], now: "等你验收", waiting: "要不要保留旧登录？", next: "上线后删掉旧代码", version: BRIEFING_VERSION, language: "zh", promptKey: "", outlineKey: outlineKey(ITEMS), askCount: 1, generatedAt: 1 };
+
+  it("界面 / 速览语言是英文、存盘的是中文速览：原样给出，不藏、不降级成兜底摘要；是否落后只看对话内容", async () => {
+    const { s, kv } = service({ language: "en" });
+    kv.set("briefing:t1", zhBriefing);
+    const view = await s.view("t1");
+    expect(view.briefing).toMatchObject({ about: "给侧边栏加登录页", stages: [{ title: "做表单", note: "测试已通过" }], now: "等你验收", waiting: "要不要保留旧登录？", language: "zh" });
+    expect(view.freshness).toEqual({ state: "fresh" });
+  });
+
+  it("反过来（速览语言中文、存盘英文）同样原样给出", async () => {
+    const { s, kv } = service({ language: "zh" });
+    kv.set("briefing:t1", { ...zhBriefing, about: "Add a login page", language: "en" });
+    expect((await s.view("t1")).briefing).toMatchObject({ about: "Add a login page", language: "en" });
+  });
+
+  it("重新生成时指定语言：这一次按指定语言写，提示词与提要都换成那种语言", async () => {
+    const { s, kv, calls } = service({ language: "en" });
+    const result = await s.regenerate("t1", "zh");
+    expect(result).toMatchObject({ ok: true, status: "written" });
+    expect(result.briefing?.language).toBe("zh");
+    expect(calls[0]![1].system).toContain("简体中文");
+    expect(calls[0]![1].prompt).toContain("要求：");
+    expect(kv.get("briefing:t1")).toMatchObject({ language: "zh" });
+  });
+});
+
 describe("regenerateText（结果说明）两种语言各自纯净", () => {
   const statuses = ["written", "disabled", "empty", "unavailable", "limit", "failed"] as const;
   it("英文不含汉字，中文不含英文词", () => {

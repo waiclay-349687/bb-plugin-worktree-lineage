@@ -1,7 +1,7 @@
 /**
  * [INPUT]: 依赖 bb.sdk.threads（对话大纲、列表）与 bb.sdk.environments（对话在哪台机器）、bb.events 的 thread.idle / thread.deleted、bb.storage.kv 存盘、bb.log 记录命中的通道与跳过 / 失败的网关模型、调用方注入的 callModel（经 host.ts 的 writeBriefing 调网关或本机 claude）; 依赖 lib/briefing 的提要与解析
- * [OUTPUT]: 对外提供 createBriefingService(bb, callModel, getSettings): { view(threadId), backfill(), status()（设置页的运行状态快照）, resetCooldowns()（清冷却后补写）, resetTodayCount()（清零今天的计数）, spentToday(), regenerate(threadId)（手动重新生成：不看是否已是新的，立即按当前配置重写，返回结果） }; RegenerateResult / RegenerateStatus 类型 — 在后台为每条对话写“全程速览”并存盘；view 给界面一次性取回速览、是否落后、兜底摘要（只读）; generateBriefing(callModel, hostId, request, settings, cooldowns, now): 按顺序试网关模型链（按 settings.language 校验输出）（跳过冷却中的）、全不行再兜底本机 claude 的一次生成（不依赖 bb，可单测）; parseModelList: 逗号分隔的有序模型列表; summarizeCooldowns: 冷却表 → 设置页清单; BriefingStatus 类型; CooldownTable / GatewayStep 类型
- * [POS]: 插件服务端的速览调度; 消费者: server.ts; 与 lib/briefing.ts 的边界: 这里决定“何时写、写哪条、用哪种语言写、按什么顺序走哪条通道、哪个网关模型在冷却、写完存哪”（语言和当前界面不一致的存盘速览既不显示、也算落后要重写），提示词与输出校验在 briefing; 与 host.ts 的边界: 这里不执行任何命令，回退决策在这里、执行在 host
+ * [OUTPUT]: 对外提供 createBriefingService(bb, callModel, getSettings): { view(threadId), backfill(), status()（设置页的运行状态快照）, resetCooldowns()（清冷却后补写）, resetTodayCount()（清零今天的计数）, spentToday(), regenerate(threadId, language?)（手动重新生成：不看是否已是新的，立即按当前配置重写，可指定这一次的速览语言，返回结果） }; RegenerateResult / RegenerateStatus 类型 — 在后台为每条对话写“全程速览”并存盘；view 给界面一次性取回速览（不论语言原样给出，与 session-cockpit 同一份）、是否落后（只看对话内容）、兜底摘要（只读）; generateBriefing(callModel, hostId, request, settings, cooldowns, now): 按顺序试网关模型链（按 settings.language 校验输出）（跳过冷却中的）、全不行再兜底本机 claude 的一次生成（不依赖 bb，可单测）; parseModelList: 逗号分隔的有序模型列表; summarizeCooldowns: 冷却表 → 设置页清单; BriefingStatus 类型; CooldownTable / GatewayStep 类型
+ * [POS]: 插件服务端的速览调度; 消费者: server.ts; 与 lib/briefing.ts 的边界: 这里决定“何时写、写哪条、用哪种语言写、按什么顺序走哪条通道、哪个网关模型在冷却、写完存哪”（速览语言或提示词与存盘的不一致只决定后台重写；显示时存盘速览不论语言都原样给出），提示词与输出校验在 briefing; 与 host.ts 的边界: 这里不执行任何命令，回退决策在这里、执行在 host
  * [PROTOCOL]: 变更时更新此头部,然后检查项目根 CLAUDE.md
  */
 import type { BbPluginApi } from "@get-bb/plugin-sdk";
@@ -219,12 +219,13 @@ export function createBriefingService(bb: BbPluginApi, callModel: CallModel, get
       ),
       getSettings(),
     ]);
-    // 换了界面语言之后，旧语言写的速览不拿出来（不然就是另一种语言混进界面）；卡片先用兜底摘要，下一轮按新语言重写
-    // 输出里总带上 language（旧速览缺这个字段时补上），别的插件按语言匹配展示
-    const usable = stored && briefingLanguage(stored) === settings.language ? { ...stored, language: briefingLanguage(stored) } : null;
+    // 存盘的速览不论什么语言都原样拿出来：悬停卡片与 session-cockpit 的 Progress 显示同一份（不藏、不降级成兜底摘要）。
+    // 这里的“是否落后”只看对话内容；速览语言或提示词变了只决定后台要不要重写（见 produce），不影响显示。
+    // 输出里总带上 language（旧速览缺这个字段时补上）。
+    const shown = stored ? { ...stored, language: briefingLanguage(stored) } : null;
     return {
-      briefing: usable,
-      freshness: usable ? freshness(usable, outline) : null,
+      briefing: shown,
+      freshness: shown ? freshness(shown, outline) : null,
       recap: buildRecap(outline),
       enabled: settings.enabled,
     };
@@ -244,16 +245,18 @@ export function createBriefingService(bb: BbPluginApi, callModel: CallModel, get
    * 用户手动“重新生成”（force = true）不看这些，立即按当前配置重写。两种都尊重开关、每天上限，并返回结果说明发生了什么。
    * 同一条对话同时只写一份：正在写时再来一次（后台排队或用户连点）直接复用那一次的结果。
    */
-  function write(threadId: string, force = false): Promise<RegenerateResult> {
+  function write(threadId: string, force = false, language?: Lang): Promise<RegenerateResult> {
     const running = inflight.get(threadId);
     if (running) return running;
-    const job = produce(threadId, force).finally(() => inflight.delete(threadId));
+    const job = produce(threadId, force, language).finally(() => inflight.delete(threadId));
     inflight.set(threadId, job);
     return job;
   }
 
-  async function produce(threadId: string, force: boolean): Promise<RegenerateResult> {
-    const settings = await getSettings();
+  async function produce(threadId: string, force: boolean, language?: Lang): Promise<RegenerateResult> {
+    // 手动重新生成可以指定这一次用什么语言写（session-cockpit 传 Progress 板块的有效语言）
+    const loaded = await getSettings();
+    const settings = language ? { ...loaded, language } : loaded;
     if (!settings.enabled) return { ok: false, status: "disabled", briefing: null };
 
     const thread = (await bb.sdk.threads.get({ threadId })) as unknown as ThreadRecord;
@@ -323,11 +326,12 @@ export function createBriefingService(bb: BbPluginApi, callModel: CallModel, get
   }
 
   /** 用户手动重新生成一条对话的速览：不看是否已是新的，立即按当前配置重写；结果里说明成功或为什么没写成 */
-  async function regenerate(threadId: string): Promise<RegenerateResult> {
+  async function regenerate(threadId: string, language?: Lang): Promise<RegenerateResult> {
     try {
-      const first = await write(threadId, true);
-      // 正好碰上后台在写这条（复用了它的结果）而后台判断“不必写”：那不是用户要的，再强制写一次
-      return first.status === "skipped" ? await write(threadId, true) : first;
+      const first = await write(threadId, true, language);
+      // 正好碰上后台在写这条（复用了它的结果）而后台判断“不必写”或语言不对：那不是用户要的，再强制写一次
+      const again = first.status === "skipped" || (language !== undefined && first.ok && first.briefing?.language !== language);
+      return again ? await write(threadId, true, language) : first;
     } catch (error) {
       return { ok: false, status: "failed", briefing: null, error: error instanceof Error ? error.message : String(error) };
     }

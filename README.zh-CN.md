@@ -145,7 +145,7 @@ git -C <主检出> worktree remove <路径> && git -C <主检出> branch -d <分
 
 在 bb 的插件设置里修改，或者用命令行。改 `language` 立即生效：
 - 选了哪种语言，整个界面就只用这种语言。按钮、标记、时间（`5m` / `5分钟`）、提示和悬停卡片都算在内。
-- 速览会按新语言重写；重写之前卡片只显示摘要，不会混进另一种语言。
+- 速览会在后台按新的速览语言重写；重写之前，原来的速览照样完整显示（不论用什么语言写的）。悬停卡片和 Session Cockpit 的 Progress 始终显示同一份速览。
 - 设置页本身由 bb 渲染，固定为英文，各项设置的中文说明见上表。
 
 ```sh
@@ -176,7 +176,7 @@ bb plugin config worktree-lineage unset briefingGatewayModel        # 恢复默�
 别的插件可以按插件 id `worktree-lineage` 调用：
 
 - `briefing({ threadId })`：一条对话存盘的速览，`briefing.language` 为 `"en"` 或 `"zh"`。
-- `regenerateBriefing({ threadId })`：不管速览是不是最新的，立即按当前设置重写这条对话的速览，返回 `{ ok, status, briefing, error? }`。`status` 为 `written`、`disabled`、`empty`、`unavailable`、`limit` 或 `failed` 之一；同一条对话同时只跑一次。
+- `regenerateBriefing({ threadId, language? })`：不管速览是不是最新的，立即按当前设置重写这条对话的速览（给了 `language` 就按它写，并同时存为速览语言），返回 `{ ok, status, briefing, error? }`。`status` 为 `written`、`disabled`、`empty`、`unavailable`、`limit` 或 `failed` 之一；同一条对话同时只跑一次。
 - `briefingConfig()` 返回 `{ enabled, language, gatewayUrl, gatewayModel, fallbackModel, systemPrompt, defaultSystemPromptEn, defaultSystemPromptZh, dailyLimit, todayCount, resolvedLanguage }`。
 - `setBriefingConfig({ enabled?, language?, gatewayUrl?, gatewayModel?, fallbackModel?, systemPrompt?, dailyLimit?, resetTodayCount?, clearCooldowns? })`：写进同一份设置，或执行清零 / 清冷却，返回更新后的 `briefingConfig`。
 
