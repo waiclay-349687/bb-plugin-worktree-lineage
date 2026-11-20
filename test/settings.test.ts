@@ -3,6 +3,7 @@ import { summarizeCooldowns } from "../briefings";
 import { serverContract, settingsStatusSchema, type SettingsStatus } from "../lib/contract";
 import { agoText, MESSAGES } from "../lib/i18n";
 import { parseSettledMap, settledToPrune, type SettleCheckable } from "../lib/settle";
+import { normalizeSettings } from "../lib/prefs";
 
 const HAN = /[一-鿿]/;
 
@@ -54,6 +55,8 @@ describe("本机 Settle 记录", () => {
 
 describe("设置页 RPC 契约", () => {
   const status: SettingsStatus = {
+    values: normalizeSettings({}),
+    defaultPrompts: { en: "default en", zh: "default zh" },
     language: "auto",
     briefingLanguage: "en",
     briefingEnabled: true,

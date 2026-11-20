@@ -1606,6 +1606,82 @@
   padding: 0;
   list-style: none;
 }
+/* 设置行：左边是名字，右边是控件；窄时控件换到下一行。说明 / 错误在下面一行 */
+.wl-set-row {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+  padding: 6px 0;
+}
+.wl-set-row-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px 12px;
+  min-width: 0;
+}
+.wl-set-label {
+  font-size: var(--text-sm, 0.875rem);
+}
+.wl-set-inline {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  font-size: var(--text-xs, 0.75rem);
+}
+.wl-set-input,
+.wl-set-textarea {
+  min-width: 0;
+  border: 1px solid var(--wl-set-line);
+  border-radius: calc(var(--radius, 0.5rem) - 2px);
+  background: color-mix(in oklab, var(--ink, currentColor) 3%, transparent);
+  color: inherit;
+  font-size: var(--text-xs, 0.75rem);
+  outline: none;
+  transition: border-color 0.15s ease;
+}
+.wl-set-input {
+  width: min(360px, 100%);
+  height: 28px;
+  padding: 0 8px;
+}
+.wl-set-input[data-mono="true"],
+.wl-set-textarea {
+  font-family: var(--font-mono, ui-monospace, monospace);
+}
+.wl-set-number {
+  width: 84px;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+.wl-set-textarea {
+  width: 100%;
+  padding: 8px;
+  line-height: 1.5;
+  resize: vertical;
+}
+.wl-set-input:focus,
+.wl-set-textarea:focus {
+  border-color: color-mix(in oklab, var(--primary) 60%, transparent);
+}
+.wl-set-input:disabled,
+.wl-set-textarea:disabled {
+  opacity: 0.6;
+}
+.wl-set-btn[data-primary="true"] {
+  border-color: transparent;
+  background: var(--primary);
+  color: var(--primary-foreground, var(--canvas));
+}
+.wl-set-field-error {
+  margin: 0;
+  color: var(--destructive, var(--attention));
+  font-size: var(--text-xs, 0.75rem);
+}
 .wl-set-warn {
   color: var(--attention);
 }
@@ -1613,4 +1689,37 @@
   margin: 0;
   color: var(--destructive, var(--attention));
   font-size: var(--text-xs, 0.75rem);
+}
+
+/* 悬停卡片标题右侧的“重新生成速览”：平时淡，悬停卡片时才清楚；进行中图标转圈 */
+.wl-peek-regen {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  margin-left: auto;
+  border-radius: var(--wl-r-sm);
+  color: var(--muted-foreground);
+  opacity: 0.55;
+  transition: opacity 0.15s ease, background-color 0.15s ease, color 0.15s ease;
+}
+.wl-peek:hover .wl-peek-regen {
+  opacity: 1;
+}
+.wl-peek-regen:hover:not(:disabled) {
+  color: var(--popover-foreground);
+  background: color-mix(in oklab, var(--ink) 8%, transparent);
+}
+.wl-peek-regen[data-running="true"] svg {
+  animation: wl-spin 0.9s linear infinite;
+}
+.wl-peek-regen-note {
+  margin: 8px 0 0;
+  font-size: var(--text-2xs, 0.6875rem);
+  color: var(--muted-foreground);
+}
+.wl-peek-regen-note[data-state="error"] {
+  color: var(--destructive, var(--attention));
 }

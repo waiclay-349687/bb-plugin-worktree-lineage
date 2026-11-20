@@ -57,12 +57,12 @@ Rest the pointer on a thread for about half a second and a briefing card appears
 - Where it stands now, what it is waiting on you for, and the likely next step.
 - Progress: turns, dispatched threads, pull request, lines changed.
 
-Moving between rows morphs one card instead of flashing new ones. You can move onto the card to select and copy text, and `Esc` closes it.
+Moving between rows morphs one card instead of flashing new ones. You can move onto the card to select and copy text, and `Esc` closes it. The small refresh button next to the title rewrites the briefing right away with the current settings.
 
 Briefings are written in the background by a small model and saved:
 - **When:** only after a turn ends, plus a one-time catch-up at startup for threads active in the last 14 days (at most 40). Hovering only reads the saved result and never calls a model.
 - **Free fallback:** until a briefing exists, or once it falls behind, the card shows a zero-cost recap built from bb's conversation outline (your last request and the reply).
-- **Guard rails:** one briefing at a time, at most 300 a day, and the queue stops after 3 failures in a row.
+- **Guard rails:** one briefing at a time, a daily limit (300 by default, adjustable), and the queue stops after 3 failures in a row.
 
 **Which model writes them.** The plugin first tries an OpenAI-compatible gateway on your own machine (by default a local Magpie gateway at `http://127.0.0.1:3425`), then falls back to your local Claude Code CLI:
 
@@ -136,6 +136,12 @@ git -C <main checkout> worktree remove <path> && git -C <main checkout> branch -
 | `briefingGatewayUrl` | `http://127.0.0.1:3425` | OpenAI-compatible gateway tried first. Leave empty to use only the local Claude CLI. |
 | `briefingGatewayModel` | `workbuddy/deepseek-v4.1-flash, opencode-zen/deepseek-v4.1-flash-free` | Comma-separated models on that gateway, tried in order. A single name works too. |
 | `briefingModel` | `haiku` | Model passed to `claude --model` when every gateway model fails. |
+| `briefingLanguage` | `auto` | Language briefings are written in: `auto` (follow the interface), `en` or `zh`. Keep an English interface with Chinese briefings by picking `zh`. |
+| `briefingSystemPrompt` | empty | Custom system prompt for briefings; empty uses the built-in one. The required JSON output format is always appended, and changing the prompt rewrites briefings. |
+| `briefingDailyLimit` | `300` | At most this many briefings a day (10–2000). |
+| `peekEnabled` | `true` | Show the hover briefing card. |
+| `peekDelayMs` | `450` | How long the pointer rests on a thread before the card appears (100–1500 ms). |
+| `defaultView` | `conversations` | View the list opens in: `conversations` or `branch-tree`. A view you pick in the list is remembered. |
 
 Change them in bb's plugin settings, or from the CLI. Changing `language` takes effect immediately:
 - Whichever language you pick, the whole interface uses only that language. That covers buttons, tags, times (`5m` / `5分钟`), tooltips and the hover card. In Chinese, Settle becomes 搁置 and Settled becomes 已搁置.
@@ -153,12 +159,28 @@ bb plugin config worktree-lineage unset briefingGatewayModel        # back to th
 
 ### Settings panel
 
-The plugin's page in bb (**Settings → Plugins → Worktree Lineage**) adds a **Status and quick actions** panel below bb's generated configuration form:
-- **Language**: one-tap switch between Auto, English and 简体中文. It applies immediately to the list and the panel.
-- **Hover briefings**: an on/off switch, plus live status. Status covers the route, the briefing language, the last briefing and today's count against the daily limit. It also lists any models cooling down, threads waiting to retry, and a pause after repeated failures, with a button to clear them.
-- **Settled threads**: how many threads are settled in this browser, and **Unsettle all**. This clears only this browser's records and never archives anything.
+The plugin's page in bb (**Settings → Plugins → Worktree Lineage**) is a full settings panel in the interface language. It replaces bb's generated English form, which stays registered so `bb plugin config` keeps working:
+- **Interface**: language, default view, hover card on/off, and its delay.
+- **Hover briefings**:
+  - on/off, briefing language, gateway address and model chain, fallback Claude model;
+  - daily limit, with a button to reset today's count;
+  - custom prompt, with **Fill in default** and **Restore default**.
+- **Briefing status**: live route, briefing language, last briefing, and any cooldowns, with a button to clear them.
+- **Settled threads**: how many are settled in this browser, and **Unsettle all**. This clears only this browser's records.
 
-The panel writes the same settings as the form above and as `bb plugin config`.
+Changes apply immediately, also to the sidebar on the same page.
+
+<details>
+<summary>Cross-plugin contract (for session-cockpit)</summary>
+
+Other plugins can call these RPCs with plugin id `worktree-lineage`:
+
+- `briefing({ threadId })`: the saved briefing for a thread, including `briefing.language` (`"en"` or `"zh"`).
+- `regenerateBriefing({ threadId })` rewrites that thread's briefing now with the current settings, even if it is up to date, and returns `{ ok, status, briefing, error? }`. `status` is one of `written`, `disabled`, `empty`, `unavailable`, `limit` or `failed`. Concurrent calls for the same thread share one run.
+- `briefingConfig()` returns `{ enabled, language, gatewayUrl, gatewayModel, fallbackModel, systemPrompt, defaultSystemPromptEn, defaultSystemPromptZh, dailyLimit, todayCount, resolvedLanguage }`.
+- `setBriefingConfig({ enabled?, language?, gatewayUrl?, gatewayModel?, fallbackModel?, systemPrompt?, dailyLimit?, resetTodayCount?, clearCooldowns? })` writes the same settings, or runs the reset or clear action, and returns the updated `briefingConfig`.
+
+</details>
 
 ## Install
 

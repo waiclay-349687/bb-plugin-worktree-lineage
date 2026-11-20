@@ -57,12 +57,12 @@
 - 现在停在哪、等你做什么决定、下一步大概做什么。
 - 进展：轮数、派出的对话、PR、改动行数。
 
-在对话之间移动时，是同一张卡片连续变形，不会一闪一闪。鼠标可以移到卡片上选中、复制文字，`Esc` 收起。
+在对话之间移动时，是同一张卡片连续变形，不会一闪一闪。鼠标可以移到卡片上选中、复制文字，`Esc` 收起。标题旁的小刷新按钮会按当前设置立即重写速览。
 
 速览由小模型在后台写好并存盘：
 - **什么时候写**：只在一轮对话结束后写；启动时另为最近 14 天活跃的对话补写一次（最多 40 条）。悬停只读存盘的结果，从不调用模型。
 - **免费兜底**：速览还没写出来、或者已经落后于对话时，卡片先显示不花额度的摘要（取自 bb 的对话大纲：你最近的要求和答复）。
-- **保护**：一次只写一条，每天最多 300 次，连续失败 3 次就停止排队。
+- **保护**：一次只写一条，每天有上限（默认 300 次，可调），连续失败 3 次就停止排队。
 
 **由哪个模型来写**：先试你本机上的 OpenAI 兼容网关（默认是本机 Magpie 网关 `http://127.0.0.1:3425`），不行再回退到本机的 Claude Code CLI：
 
@@ -136,6 +136,12 @@ git -C <主检出> worktree remove <路径> && git -C <主检出> branch -d <分
 | `briefingGatewayUrl` | `http://127.0.0.1:3425` | 优先尝试的 OpenAI 兼容网关。留空则只用本机的 Claude CLI。 |
 | `briefingGatewayModel` | `workbuddy/deepseek-v4.1-flash, opencode-zen/deepseek-v4.1-flash-free` | 网关上按顺序尝试的模型，逗号分隔；只写一个也行。 |
 | `briefingModel` | `haiku` | 网关上的模型都失败时，传给 `claude --model` 的模型名。 |
+| `briefingLanguage` | `auto` | 速览用什么语言写：`auto`（跟随界面）、`en` 或 `zh`。想界面用英文、速览用中文，选 `zh`。 |
+| `briefingSystemPrompt` | 空 | 速览的自定义系统提示词；留空使用内置提示词。必需的 JSON 输出格式总会接在后面，改动后速览会重写。 |
+| `briefingDailyLimit` | `300` | 每天最多写几次速览（10–2000）。 |
+| `peekEnabled` | `true` | 是否显示悬停速览卡。 |
+| `peekDelayMs` | `450` | 鼠标在对话上停多久才出卡片（100–1500 毫秒）。 |
+| `defaultView` | `conversations` | 列表打开时的视图：`conversations`（对话）或 `branch-tree`（分支树）。在列表里手动切换过会记住你的选择。 |
 
 在 bb 的插件设置里修改，或者用命令行。改 `language` 立即生效：
 - 选了哪种语言，整个界面就只用这种语言。按钮、标记、时间（`5m` / `5分钟`）、提示和悬停卡片都算在内。
@@ -153,12 +159,28 @@ bb plugin config worktree-lineage unset briefingGatewayModel        # 恢复默�
 
 ### 设置面板
 
-在 bb 里打开插件页（**Settings → Plugins → Worktree Lineage**），在 bb 生成的配置表下面有一个 **状态与快捷操作** 面板：
-- **界面语言**：自动 / English / 简体中文 一键切换，列表和面板立即生效。
-- **悬停速览**：开关，加上实时状态。状态包括通道、速览语言、最近一条和今天的次数（对照每天上限）。如果有冷却中的模型、等待重试的对话，或者连续失败后已暂停，会列出来，并可一键清除。
-- **已搁置的对话**：这个浏览器里搁置了几条，以及 **全部取消搁置**。只清本机记录，不会归档任何对话。
+在 bb 里打开插件页（**Settings → Plugins → Worktree Lineage**），整页就是一个按界面语言显示的完整设置面板。它取代 bb 自动生成的英文配置表；配置项仍然登记着，`bb plugin config` 照常可用：
+- **界面**：界面语言、默认视图、悬停卡片开关和延迟。
+- **悬停速览**：
+  - 开关、速览语言、网关地址与模型链、兜底 Claude 模型；
+  - 每天上限，以及“清零今天的次数”；
+  - 自定义提示词，可以 **填入默认** 和 **恢复默认**。
+- **速览状态**：实时显示通道、速览语言、最近一条和冷却情况，可一键清除冷却。
+- **已搁置的对话**：这个浏览器里搁置了几条，以及 **全部取消搁置**，只清本机记录。
 
-面板改的和上面的配置表、`bb plugin config` 是同一份设置。
+改动立即生效，同一页面里的侧边栏也会跟着变。
+
+<details>
+<summary>跨插件契约（给 session-cockpit）</summary>
+
+别的插件可以按插件 id `worktree-lineage` 调用：
+
+- `briefing({ threadId })`：一条对话存盘的速览，`briefing.language` 为 `"en"` 或 `"zh"`。
+- `regenerateBriefing({ threadId })`：不管速览是不是最新的，立即按当前设置重写这条对话的速览，返回 `{ ok, status, briefing, error? }`。`status` 为 `written`、`disabled`、`empty`、`unavailable`、`limit` 或 `failed` 之一；同一条对话同时只跑一次。
+- `briefingConfig()` 返回 `{ enabled, language, gatewayUrl, gatewayModel, fallbackModel, systemPrompt, defaultSystemPromptEn, defaultSystemPromptZh, dailyLimit, todayCount, resolvedLanguage }`。
+- `setBriefingConfig({ enabled?, language?, gatewayUrl?, gatewayModel?, fallbackModel?, systemPrompt?, dailyLimit?, resetTodayCount?, clearCooldowns? })`：写进同一份设置，或执行清零 / 清冷却，返回更新后的 `briefingConfig`。
+
+</details>
 
 ## 安装
 

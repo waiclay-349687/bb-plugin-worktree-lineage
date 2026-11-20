@@ -1,10 +1,10 @@
 /**
  * [INPUT]: 依赖 @get-bb/plugin-sdk/app 的线程数据类型、provider 图标、keyed RPC 查询与 useRpc; 读取本插件服务端的 briefing RPC（存盘的全程速览 + 是否落后 + 兜底摘要，一次取回）; 读取内置插件 bb--git 的 status 与 bb--github-pr-status 的 pullRequests; 依赖 components/i18n 的 useT（卡片标签按界面语言）
- * [OUTPUT]: 对外提供 Peek: 悬停预览卡。有速览时显示“一句话 + 分阶段 + 现在 / 等你 / 下一步”；没有速览或速览落后时，用不花 token 的摘要（你问 / 答复）补上。卡片自己从不触发模型调用。在对话之间移动时是同一张卡片连续变形：位置和高度一起过渡，旧内容淡出的同时新内容淡入。鼠标可以移到卡片上：卡片不消失，文字可选中复制
+ * [OUTPUT]: 对外提供 Peek: 悬停预览卡（标题右侧有“重新生成速览”小按钮，调用 regenerateBriefing，结果按当前语言留在卡片底部）。有速览时显示“一句话 + 分阶段 + 现在 / 等你 / 下一步”；没有速览或速览落后时，用不花 token 的摘要（你问 / 答复）补上。卡片自己从不触发模型调用。在对话之间移动时是同一张卡片连续变形：位置和高度一起过渡，旧内容淡出的同时新内容淡入。鼠标可以移到卡片上：卡片不消失，文字可选中复制
  * [POS]: components 的浮层; 消费者: components/lineage-list.tsx; 与它的边界: 何时显示 / 隐藏由列表决定（鼠标进出卡片经 hover 回调告诉列表），这里只负责取数、展示与切换动画; 卡片渲染到 document.body（侧边栏有自己的层叠上下文，留在里面会被主区域盖住）
  * [PROTOCOL]: 变更时更新此头部,然后检查所在目录 CLAUDE.md
  */
-import { useEffect, useLayoutEffect, useRef, useState, type ComponentProps } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState, type ComponentProps } from "react";
 import { createPortal } from "react-dom";
 import { defineRpcContract } from "@get-bb/plugin-sdk";
 import {
@@ -16,7 +16,7 @@ import {
 import { z } from "zod";
 import { Glyph } from "@/components/icons";
 import { useT } from "@/components/i18n";
-import type { Messages } from "@/lib/i18n";
+import { regenerateText, type Messages } from "@/lib/i18n";
 import type { BriefingStage } from "@/lib/briefing";
 import type { BriefingView, serverContract } from "@/lib/contract";
 import { rowTone, type RowTone, type Tone } from "@/lib/view";
@@ -159,17 +159,39 @@ export function Peek({ target, hover }: { target: PeekTarget | null; hover: Peek
     };
   }, [threadId, updatedAt]);
 
+  /** 重新生成之后重读这一条的存盘速览并换上去（只读存盘，不花钱） */
+  const reload = useCallback(async (id: string) => {
+    const view = await rpcRef.current.call("briefing", { threadId: id });
+    viewCache.set(id, view);
+    if (latest.current?.thread.id === id) setShown({ threadId: id, target: latest.current, view });
+  }, []);
+
   if (shown === null) return null;
   const closing = target === null;
   // 画的就是鼠标所在的这条：位置、状态跟着最新的 target 走；关闭中保留最后一条内容淡出
   const activeTarget = !closing && shown.threadId === threadId ? target : shown.target;
-  return <PeekCard target={activeTarget} view={shown.view} hover={hover} closing={closing} />;
+  return <PeekCard target={activeTarget} view={shown.view} hover={hover} closing={closing} onRegenerated={reload} />;
 }
 
 const reducedMotion = () => typeof matchMedia === "function" && matchMedia("(prefers-reduced-motion: reduce)").matches;
 
-function PeekCard({ target, view, hover, closing }: { target: PeekTarget; view: BriefingView; hover: PeekHover; closing: boolean }) {
+function PeekCard({ target, view, hover, closing, onRegenerated }: { target: PeekTarget; view: BriefingView; hover: PeekHover; closing: boolean; onRegenerated: (threadId: string) => Promise<void> }) {
   const tx = useT();
+  const rpc = useRpc<typeof serverContract>();
+  // 手动重新生成：进行中禁用按钮；结束后在卡片底部留一句结果（按当前语言），换到别的对话就清掉
+  const [regen, setRegen] = useState<{ threadId: string; state: "running" | "done" | "error"; text: string } | null>(null);
+  const regenHere = regen && regen.threadId === target.thread.id ? regen : null;
+  const regenerate = async () => {
+    const threadId = target.thread.id;
+    setRegen({ threadId, state: "running", text: tx.regenerating });
+    try {
+      const result = await rpc.call("regenerateBriefing", { threadId });
+      if (result.ok) await onRegenerated(threadId);
+      setRegen({ threadId, state: result.ok ? "done" : "error", text: regenerateText(tx, result.status) });
+    } catch {
+      setRegen({ threadId, state: "error", text: tx.regenFailed });
+    }
+  };
   const { thread } = target;
   const envId = thread.environment?.id ?? null;
   const keys = envId ? [envId] : [];
@@ -257,6 +279,19 @@ function PeekCard({ target, view, hover, closing }: { target: PeekTarget; view: 
         <div className="wl-peek-head">
           <span className="wl-peek-logo">{target.provider ? <ProviderIcon providerKind="agent" provider={target.provider} className="size-3.5" /> : null}</span>
           <span className="wl-peek-title">{thread.displayTitle}</span>
+          {view.enabled && recap.turns > 0 ? (
+            <button
+              type="button"
+              className="wl-peek-regen"
+              aria-label={tx.regenerate}
+              title={tx.regenerate}
+              disabled={regenHere?.state === "running"}
+              data-running={regenHere?.state === "running" || undefined}
+              onClick={() => void regenerate()}
+            >
+              <Glyph name="refresh" size={12} />
+            </button>
+          ) : null}
         </div>
         <div className="wl-peek-meta">
           {target.projectName ? <span>{target.projectName}</span> : null}
@@ -326,6 +361,11 @@ function PeekCard({ target, view, hover, closing }: { target: PeekTarget; view: 
             </>
           ) : null}
         </dl>
+        {regenHere ? (
+          <p className="wl-peek-regen-note" data-state={regenHere.state} role="status">
+            {regenHere.text}
+          </p>
+        ) : null}
         {briefing && !fresh ? (
           <p className="wl-peek-behind">{newAsks > 0 ? tx.behindByAsks(newAsks) : tx.behindLatestReply}</p>
         ) : null}

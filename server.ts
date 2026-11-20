@@ -1,29 +1,27 @@
 /**
- * [INPUT]: 依赖 bb.sdk.projects / bb.sdk.environments 读取项目源与 bb 记录的起点分支; 依赖 host.ts 的 scanLineage 在各机器上读 git、writeBriefing 调网关或本机 claude; 依赖 briefings.ts 的速览调度; 依赖 bb.settings 的五项设置（界面语言 language，速览的开关、网关地址、网关上按顺序尝试的模型列表、兜底的 claude 模型）; 依赖 lib/i18n 的设置项英文文案; 依赖 bb.storage.kv 记住前端报上来的界面语言
- * [OUTPUT]: 对外提供 serverContract.lineage RPC（每个项目的分支血缘扫描结果 + bb 已登记环境路径）、serverContract.briefing RPC（读一条对话存盘的速览）、serverContract.settingsStatus / updateSettings / resetBriefingCooldowns RPC（设置页读状态、改语言与速览开关、清冷却）与 serverContract.reportLanguage RPC（前端报告解析出的界面语言，auto 模式下决定速览语言、设置页标签固定英文）; 默认导出插件工厂
+ * [INPUT]: 依赖 bb.sdk.projects / bb.sdk.environments 读取项目源与 bb 记录的起点分支; 依赖 host.ts 的 scanLineage 在各机器上读 git、writeBriefing 调网关或本机 claude; 依赖 briefings.ts 的速览调度; 依赖 bb.settings 的全部设置项（界面语言、速览开关 / 语言 / 网关 / 模型链 / 兜底模型 / 自定义提示词 / 每天上限、悬停卡片开关与延迟、默认视图），读值经 lib/prefs 收紧; 依赖 lib/i18n 的设置项英文文案; 依赖 bb.storage.kv 记住前端报上来的界面语言
+ * [OUTPUT]: 对外提供 serverContract.lineage RPC（每个项目的分支血缘扫描结果 + bb 已登记环境路径）、serverContract.briefing RPC（读一条对话存盘的速览）、serverContract.settingsStatus / updateSettings / resetBriefingCooldowns RPC（设置页读状态、改全部设置项、清零今天次数、清冷却）、serverContract.briefingConfig / setBriefingConfig / regenerateBriefing RPC（给 session-cockpit 读写速览配置、手动重新生成一条对话的速览）与 serverContract.reportLanguage RPC（前端报告解析出的界面语言，auto 模式下决定速览语言、设置页标签固定英文）; 默认导出插件工厂
  * [POS]: 插件服务端汇总层; 消费者: app.tsx、components/peek.tsx; 与 host.ts 的边界: 本文件不执行命令，只负责收集 bb 侧事实、调度 host、缓存; 与 briefings.ts 的边界: 速览何时写、写哪条都在 briefings，这里只接线
  * [PROTOCOL]: 变更时更新此头部,然后检查所在目录 CLAUDE.md
  */
 import type { BbPluginApi } from "@get-bb/plugin-sdk";
 import { createBriefingService, parseModelList, type BriefingSettings } from "./briefings";
-import { isLanguageSetting, LANGUAGE_OPTION_LABELS, LANGUAGE_SETTINGS, SETTINGS_TEXT, type Lang, type LanguageSetting } from "./lib/i18n";
+import { LANGUAGE_OPTION_LABELS, LANGUAGE_SETTINGS, SETTINGS_TEXT, type Lang } from "./lib/i18n";
+import { DAILY_LIMIT, DEFAULT_CLAUDE_MODEL, DEFAULT_GATEWAY_MODELS, DEFAULT_GATEWAY_URL, DEFAULT_VIEWS, normalizeSettings, PEEK_DELAY, resolveBriefingLanguage, type SettingsValues } from "./lib/prefs";
+import { defaultSystemPrompt } from "./lib/briefing";
 import {
   hostContract,
   serverContract,
   type ProjectLineage,
   type SettingsStatus,
+  type SettingsPatch,
+  type BriefingConfig,
+  briefingConfigToPatch,
 } from "./lib/contract";
 
 /** 扫描结果缓存时长：侧边栏轮询频繁，git 扫描不必每次都跑 */
 const CACHE_TTL_MS = 15_000;
 const SCAN_TIMEOUT_MS = 60_000;
-/**
- * 速览的模型链（按成本优先级）：本机 Magpie 网关上的 workbuddy DeepSeek → 同网关的免费 DeepSeek（额度少）
- * → 本机 claude 兜底。付费直连的模型不进默认链。
- */
-const DEFAULT_GATEWAY_URL = "http://127.0.0.1:3425";
-const DEFAULT_GATEWAY_MODELS = ["workbuddy/deepseek-v4.1-flash", "opencode-zen/deepseek-v4.1-flash-free"];
-const DEFAULT_CLAUDE_MODEL = "haiku";
 /** 前端最近一次报上来的界面语言（en / zh） */
 const UI_LANGUAGE_KEY = "ui-language";
 /** auto 模式下界面语言变了：稳定这么久才按新语言补写速览，且这段冷却内最多补写一次 */
@@ -69,20 +67,37 @@ export default async function plugin(bb: BbPluginApi) {
       default: "auto",
     },
     briefingEnabled: { type: "boolean", ...text.briefingEnabled, default: true },
+    briefingLanguage: {
+      type: "select",
+      ...text.briefingLanguage,
+      options: [...LANGUAGE_SETTINGS],
+      experimental_optionLabels: LANGUAGE_OPTION_LABELS,
+      default: "auto",
+    },
     briefingGatewayUrl: { type: "string", ...text.briefingGatewayUrl, default: DEFAULT_GATEWAY_URL },
     briefingGatewayModel: { type: "string", ...text.briefingGatewayModel, default: DEFAULT_GATEWAY_MODELS.join(", ") },
     briefingModel: { type: "string", ...text.briefingModel, default: DEFAULT_CLAUDE_MODEL },
+    briefingSystemPrompt: { type: "string", ...text.briefingSystemPrompt, experimental_multiline: true, default: "" },
+    briefingDailyLimit: { type: "number", ...text.briefingDailyLimit, default: DAILY_LIMIT.default },
+    peekEnabled: { type: "boolean", ...text.peekEnabled, default: true },
+    peekDelayMs: { type: "number", ...text.peekDelayMs, default: PEEK_DELAY.default },
+    defaultView: { type: "select", ...text.defaultView, options: [...DEFAULT_VIEWS], default: "conversations" },
   });
-  /** 速览实际用的语言：设置为 en / zh 时直接用；auto 时只有前端知道浏览器语言，用它报上来的值 */
-  const briefingLanguageOf = (setting: string): Lang => (setting === "en" || setting === "zh" ? setting : uiLanguage);
+  /** 读设置一律经 normalizeSettings 收紧：CLI 写进去的值可能越界 */
+  const readSettings = async (): Promise<SettingsValues> => normalizeSettings(await settings.get());
+  /** 速览实际用的语言：速览语言单独设了 en / zh 就用它；auto 跟随界面语言（界面也是 auto 时用前端报上来的值） */
+  const briefingLanguageOf = (values: Pick<SettingsValues, "language" | "briefingLanguage">): Lang =>
+    resolveBriefingLanguage(values.briefingLanguage, values.language, uiLanguage);
   const briefingSettings = async (): Promise<BriefingSettings> => {
-    const values = await settings.get();
+    const values = await readSettings();
     const gatewayUrl = values.briefingGatewayUrl.trim();
     return {
       enabled: values.briefingEnabled,
-      language: briefingLanguageOf(values.language),
+      language: briefingLanguageOf(values),
       model: values.briefingModel.trim() || DEFAULT_CLAUDE_MODEL,
       gateway: gatewayUrl ? { baseUrl: gatewayUrl, models: parseModelList(values.briefingGatewayModel, DEFAULT_GATEWAY_MODELS) } : null,
+      systemPrompt: values.briefingSystemPrompt,
+      dailyLimit: values.briefingDailyLimit,
     };
   };
   const briefings = createBriefingService(
@@ -91,9 +106,13 @@ export default async function plugin(bb: BbPluginApi) {
     briefingSettings,
   );
   // 刚打开开关、或者速览语言变了：补写一遍（补写有条数上限，旧语言的速览在此之前不显示）
-  settings.onChange((next, prev) => {
-    const languageChanged = briefingLanguageOf(next.language) !== briefingLanguageOf(prev.language);
-    if ((next.briefingEnabled && !prev.briefingEnabled) || (next.briefingEnabled && languageChanged)) void briefings.backfill().catch(() => undefined);
+  // 刚打开开关、速览语言变了、或换了提示词：补写一遍（补写有条数与每天上限）
+  settings.onChange((nextRaw, prevRaw) => {
+    const next = normalizeSettings(nextRaw);
+    const prev = normalizeSettings(prevRaw);
+    const languageChanged = briefingLanguageOf(next) !== briefingLanguageOf(prev);
+    const promptChanged = next.briefingSystemPrompt.trim() !== prev.briefingSystemPrompt.trim();
+    if (next.briefingEnabled && (!prev.briefingEnabled || languageChanged || promptChanged)) void briefings.backfill().catch(() => undefined);
   });
   /**
    * 前端解析出的界面语言（auto 时由浏览器语言决定），正在用的窗口说了算（前端在挂载与窗口获得焦点时报告）。
@@ -111,8 +130,9 @@ export default async function plugin(bb: BbPluginApi) {
     clearTimeout(languageTimer);
     languageTimer = setTimeout(() => {
       void (async () => {
-        const values = await settings.get();
-        if (uiLanguage !== language || !values.briefingEnabled || values.language !== "auto") return;
+        const values = await readSettings();
+        // 只有速览语言最终跟随浏览器（速览与界面都是 auto）时，界面语言变了才影响速览
+        if (uiLanguage !== language || !values.briefingEnabled || values.language !== "auto" || values.briefingLanguage !== "auto") return;
         if (Date.now() - lastLanguageBackfill < LANGUAGE_BACKFILL_COOLDOWN_MS) return;
         lastLanguageBackfill = Date.now();
         await briefings.backfill();
@@ -123,14 +143,43 @@ export default async function plugin(bb: BbPluginApi) {
 
   /** 设置页的状态快照：设置值来自 bb.settings（与声明式设置、CLI 同一份），运行状态来自速览服务 */
   async function settingsStatus(): Promise<SettingsStatus> {
-    const [values, briefing, effective] = await Promise.all([settings.get(), briefings.status(), briefingSettings()]);
+    const [values, briefing, effective] = await Promise.all([readSettings(), briefings.status(), briefingSettings()]);
     return {
-      language: isLanguageSetting(values.language) ? values.language : "auto",
+      values,
+      defaultPrompts: { en: defaultSystemPrompt("en"), zh: defaultSystemPrompt("zh") },
+      language: values.language,
       briefingLanguage: effective.language,
       briefingEnabled: values.briefingEnabled,
       gateway: effective.gateway,
       claudeModel: effective.model,
       briefing,
+    };
+  }
+
+  /** 设置页与别的插件改设置的唯一入口：写进 bb.settings（与声明式设置、CLI 同一份），再执行一次性动作 */
+  async function applyPatch(patch: SettingsPatch): Promise<void> {
+    const { resetTodayCount, clearCooldowns, ...values } = patch;
+    const defined = Object.fromEntries(Object.entries(values).filter(([, value]) => value !== undefined));
+    if (Object.keys(defined).length > 0) await settings.experimental_set(defined);
+    if (resetTodayCount) await briefings.resetTodayCount();
+    if (clearCooldowns) await briefings.resetCooldowns();
+  }
+
+  /** 给 session-cockpit 的速览配置（字段见 briefingConfigSchema） */
+  async function briefingConfig(): Promise<BriefingConfig> {
+    const [values, todayCount] = await Promise.all([readSettings(), briefings.spentToday()]);
+    return {
+      enabled: values.briefingEnabled,
+      language: values.briefingLanguage,
+      gatewayUrl: values.briefingGatewayUrl,
+      gatewayModel: values.briefingGatewayModel,
+      fallbackModel: values.briefingModel,
+      systemPrompt: values.briefingSystemPrompt,
+      defaultSystemPromptEn: defaultSystemPrompt("en"),
+      defaultSystemPromptZh: defaultSystemPrompt("zh"),
+      dailyLimit: values.briefingDailyLimit,
+      todayCount,
+      resolvedLanguage: briefingLanguageOf(values),
     };
   }
 
@@ -236,11 +285,14 @@ export default async function plugin(bb: BbPluginApi) {
     reportLanguage: ({ language }) => reportLanguage(language),
     settingsStatus: () => settingsStatus(),
     updateSettings: async (patch) => {
-      const values: { language?: LanguageSetting; briefingEnabled?: boolean } = {};
-      if (patch.language !== undefined) values.language = patch.language;
-      if (patch.briefingEnabled !== undefined) values.briefingEnabled = patch.briefingEnabled;
-      if (Object.keys(values).length > 0) await settings.experimental_set(values);
+      await applyPatch(patch);
       return settingsStatus();
+    },
+    briefingConfig: () => briefingConfig(),
+    regenerateBriefing: ({ threadId }) => briefings.regenerate(threadId),
+    setBriefingConfig: async (input) => {
+      await applyPatch(briefingConfigToPatch(input));
+      return briefingConfig();
     },
     resetBriefingCooldowns: async () => {
       await briefings.resetCooldowns();

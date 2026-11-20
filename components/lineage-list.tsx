@@ -1,5 +1,5 @@
 /**
- * [INPUT]: 依赖 @get-bb/plugin-sdk/app 的侧边栏线程数据、provider 图标、线程快捷操作与菜单、状态组件、导航; 依赖 server.ts 的 lineage RPC; 依赖 lib/tree 建树、lib/conversations（对话视图）与 lib/view（分支树视图）两个展示模型; 依赖 components/motion 的存在感列表与全局 FLIP 滑移; 依赖 components/i18n 的 LanguageProvider / useT / useLang（全部界面文案按界面语言从词典取）; 依赖 lib/settle 的本机搁置存储约定（设置页“全部取消搁置”后经 SETTLED_CHANGED_EVENT 重读，列表加载完才清理过期记录）; 依赖 lib/row-menu 的搁置可见规则与插件菜单项（经 inline 并入 bb 的长按 / 右键菜单与桌面“更多”菜单）
+ * [INPUT]: 依赖 @get-bb/plugin-sdk/app 的侧边栏线程数据、provider 图标、线程快捷操作与菜单、状态组件、导航; 依赖 server.ts 的 lineage RPC; 依赖 lib/tree 建树、lib/conversations（对话视图）与 lib/view（分支树视图）两个展示模型; 依赖 components/motion 的存在感列表与全局 FLIP 滑移; 依赖 components/i18n 的 LanguageProvider / useT / useLang（全部界面文案按界面语言从词典取）; 依赖 lib/settle 的本机搁置存储约定（设置页“全部取消搁置”后经 SETTLED_CHANGED_EVENT 重读，列表加载完才清理过期记录）; 依赖 lib/row-menu 的搁置可见规则与插件菜单项（经 inline 并入 bb 的长按 / 右键菜单与桌面“更多”菜单）; 依赖 components/prefs 的 usePluginPrefs（悬停卡片开关与延迟、默认视图）
  * [OUTPUT]: 对外提供 LineageList: experimental_threadList 槽位的列表组件
  * [POS]: 插件界面主体; 消费者: app.tsx; 与 lib 的边界: 谁挂在谁下面、怎么排序由 lib/conversations（对话视图：对话是主角，不出现分支）与 lib/view（分支树视图：分支是主行，对话是次级行）决定，这里只负责渲染与交互（折叠、视图切换、悬停快捷操作、轮询、入场/退场/重排/置顶动效）; 视觉全部在 styles.css，颜色只用宿主主题变量
  * [PROTOCOL]: 变更时更新此头部,然后检查所在目录 CLAUDE.md
@@ -38,6 +38,7 @@ import { isThreadSettled, needsUserAttention, nextAttentionId, orderByVisual, pa
 import type { Messages } from "@/lib/i18n";
 import { settleMode, threadMenuItems } from "@/lib/row-menu";
 import { LanguageProvider, useLang, useT } from "@/components/i18n";
+import { usePluginPrefs } from "@/components/prefs";
 import { buildProjectView, pathLabels, relativeTime, rollupTone, rowColor, rowTone, toneOf, worktreeCleanupCommand, type RowColor, type ViewNode } from "@/lib/view";
 
 type Thread = PluginSidebarThread;
@@ -59,8 +60,6 @@ const STORAGE_SETTLED = SETTLED_STORAGE_KEY;
 /** 输入停顿多久才去问 bb 的官方搜索（它搜消息内容，要走服务器） */
 const SEARCH_DEBOUNCE_MS = 260;
 const SEARCH_LIMIT = 8;
-/** 鼠标停多久才出预览卡 */
-const PEEK_DELAY_MS = 550;
 /** 鼠标离开整个列表（或离开卡片）后多久收起：要够从行上横着移到卡片上（中间有一道缝） */
 const PEEK_GRACE_MS = 300;
 /** 鼠标离开一行、但还在列表里（经过分组标题或空隙）时多久收起：这段时间里落到另一条对话上，卡片直接滑过去 */
@@ -224,7 +223,23 @@ function LineageListBody(props: PluginThreadListProps) {
   const { threads: allThreads, projects, status: threadsStatus } = useSidebarThreads();
   const { providers } = useProviders();
   const navigate = useBbNavigate();
-  const [view, setView] = useState<ViewMode>(() => (localStorage.getItem(STORAGE_VIEW) === "lineage" ? "lineage" : "family"));
+  const prefs = usePluginPrefs();
+  const prefsRef = useRef(prefs);
+  prefsRef.current = prefs;
+  // 打开时的视图：用户在列表里切过就记住那次的选择，否则用设置里的默认视图
+  const [view, setView] = useState<ViewMode>(() => {
+    const stored = localStorage.getItem(STORAGE_VIEW);
+    if (stored === "lineage" || stored === "family") return stored;
+    return prefs.defaultView === "branch-tree" ? "lineage" : "family";
+  });
+  // 在设置面板改了默认视图：清掉记住的选择，立即切过去
+  const lastDefaultView = useRef(prefs.defaultView);
+  useEffect(() => {
+    if (lastDefaultView.current === prefs.defaultView) return;
+    lastDefaultView.current = prefs.defaultView;
+    localStorage.removeItem(STORAGE_VIEW);
+    setView(prefs.defaultView === "branch-tree" ? "lineage" : "family");
+  }, [prefs.defaultView]);
   const [collapsed, setCollapsed] = usePersistentMap(STORAGE_COLLAPSED);
   const { settled, settle: rawSettle, unsettle, prune } = useSettledMap(STORAGE_SETTLED);
   const [focusId, setFocus] = useState<string | null>(null);
@@ -380,6 +395,7 @@ function LineageListBody(props: PluginThreadListProps) {
   );
   const peekSchedule = useCallback((thread: Thread, row: HTMLElement) => {
     clearTimeout(peekTimer.current);
+    if (!prefsRef.current.peekEnabled) return;
     const show = () => {
       const rect = row.getBoundingClientRect();
       const side = rootRef.current?.getBoundingClientRect();
@@ -387,7 +403,7 @@ function LineageListBody(props: PluginThreadListProps) {
     };
     // 卡片已经开着（或刚收起）：不关再开，直接移到这一行
     if (peekOpen.current || Date.now() - peekClosedAt.current < PEEK_REOPEN_MS) show();
-    else peekTimer.current = setTimeout(show, PEEK_DELAY_MS);
+    else peekTimer.current = setTimeout(show, prefsRef.current.peekDelayMs);
   }, []);
   useEffect(() => {
     // 只有“列表自己被滚动”才收起（行从鼠标下面移走了）。别处的滚动不算：
@@ -744,7 +760,7 @@ function LineageListBody(props: PluginThreadListProps) {
             />
           );
         })}
-        {!props.isCompactViewport ? <Peek target={peekTarget} hover={peekHover} /> : null}
+        {!props.isCompactViewport && prefs.peekEnabled ? <Peek target={peekTarget} hover={peekHover} /> : null}
       </div>
     </Ctx.Provider>
   );

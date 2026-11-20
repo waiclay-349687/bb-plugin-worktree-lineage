@@ -1,6 +1,6 @@
 /**
  * [INPUT]: 依赖 @get-bb/plugin-sdk 的 defineRpcContract 与 zod
- * [OUTPUT]: 对外提供 hostContract（host 端契约: scanLineage 读 git、writeBriefing 按 route 调网关或本机 claude，失败可带冷却建议）、modelRouteSchema / ModelRoute（gateway | claude 两条通道）、serverContract（app↔server 契约: lineage、briefing、settingsStatus / updateSettings / resetBriefingCooldowns（设置页）、reportLanguage）、settingsStatusSchema / SettingsStatus及血缘数据类型
+ * [OUTPUT]: 对外提供 hostContract（host 端契约: scanLineage 读 git、writeBriefing 按 route 调网关或本机 claude，失败可带冷却建议）、modelRouteSchema / ModelRoute（gateway | claude 两条通道）、serverContract（app↔server 契约: lineage、briefing、settingsStatus / updateSettings / resetBriefingCooldowns（设置页）、briefingConfig / setBriefingConfig / regenerateBriefing（给 session-cockpit 的跨插件契约）、reportLanguage）、settingsStatusSchema / settingsValuesSchema / settingsPatchSchema / briefingConfigSchema / setBriefingConfigSchema 与 briefingConfigToPatch及血缘数据类型
  * [POS]: lib 的契约层; 消费者: host.ts、server.ts、briefings.ts、lib/model-run.ts、app.tsx、components/peek.tsx、lib/lineage.ts; 只定义数据形状，不含逻辑; serverContract.briefing 的输出另被 session-cockpit 插件跨插件读取，字段不可随意改
  * [PROTOCOL]: 变更时更新此头部,然后检查所在目录 CLAUDE.md
  */
@@ -8,6 +8,7 @@ import { defineRpcContract } from "@get-bb/plugin-sdk";
 import { z } from "zod";
 import { storedBriefingSchema } from "./briefing";
 import { LANGUAGE_SETTINGS } from "./i18n";
+import { DAILY_LIMIT, DEFAULT_VIEWS, PEEK_DELAY, PROMPT_MAX_LENGTH } from "./prefs";
 
 /**
  * 分支的起点从哪来，按可信度从高到低：
@@ -146,8 +147,105 @@ export const briefingViewSchema = z.object({
 });
 export type BriefingView = z.infer<typeof briefingViewSchema>;
 
+/** regenerateBriefing 的结果（对外契约，session-cockpit 按 status 显示原因） */
+export const regenerateResultSchema = z.object({
+  ok: z.boolean(),
+  status: z.enum(["written", "disabled", "empty", "unavailable", "limit", "failed", "skipped"]),
+  briefing: storedBriefingSchema.nullable(),
+  error: z.string().optional(),
+});
+export type RegenerateResultView = z.infer<typeof regenerateResultSchema>;
+
+/** 插件全部设置项的当前值（经 lib/prefs 的 normalizeSettings 收紧后） */
+export const settingsValuesSchema = z.object({
+  language: z.enum(LANGUAGE_SETTINGS),
+  briefingEnabled: z.boolean(),
+  briefingLanguage: z.enum(LANGUAGE_SETTINGS),
+  briefingGatewayUrl: z.string(),
+  briefingGatewayModel: z.string(),
+  briefingModel: z.string(),
+  briefingSystemPrompt: z.string(),
+  briefingDailyLimit: z.number(),
+  peekEnabled: z.boolean(),
+  peekDelayMs: z.number(),
+  defaultView: z.enum(DEFAULT_VIEWS),
+});
+
+const dailyLimitInput = z.number().int().min(DAILY_LIMIT.min).max(DAILY_LIMIT.max);
+const promptInput = z.string().max(PROMPT_MAX_LENGTH);
+const textInput = z.string().max(2000);
+
+/** 设置页一次改几项：都可省略；数字与长度在这里校验，越界直接拒绝 */
+export const settingsPatchSchema = z.object({
+  language: z.enum(LANGUAGE_SETTINGS).optional(),
+  briefingEnabled: z.boolean().optional(),
+  briefingLanguage: z.enum(LANGUAGE_SETTINGS).optional(),
+  briefingGatewayUrl: textInput.optional(),
+  briefingGatewayModel: textInput.optional(),
+  briefingModel: z.string().trim().min(1).max(200).optional(),
+  briefingSystemPrompt: promptInput.optional(),
+  briefingDailyLimit: dailyLimitInput.optional(),
+  peekEnabled: z.boolean().optional(),
+  peekDelayMs: z.number().int().min(PEEK_DELAY.min).max(PEEK_DELAY.max).optional(),
+  defaultView: z.enum(DEFAULT_VIEWS).optional(),
+  /** 一次性动作：清零今天的计数、清网关与重试冷却 */
+  resetTodayCount: z.boolean().optional(),
+  clearCooldowns: z.boolean().optional(),
+});
+export type SettingsPatch = z.infer<typeof settingsPatchSchema>;
+
+/**
+ * 给 session-cockpit 等别的插件读写速览配置（按插件 id "worktree-lineage" 调用）。字段名与含义是对外契约，改了要通知对方。
+ * resolvedLanguage 是速览实际用的语言（auto 时跟随界面语言）。
+ */
+export const briefingConfigSchema = z.object({
+  enabled: z.boolean(),
+  language: z.enum(LANGUAGE_SETTINGS),
+  gatewayUrl: z.string(),
+  gatewayModel: z.string(),
+  fallbackModel: z.string(),
+  systemPrompt: z.string(),
+  defaultSystemPromptEn: z.string(),
+  defaultSystemPromptZh: z.string(),
+  dailyLimit: z.number(),
+  todayCount: z.number(),
+  resolvedLanguage: z.enum(["en", "zh"]),
+});
+export type BriefingConfig = z.infer<typeof briefingConfigSchema>;
+
+export const setBriefingConfigSchema = z.object({
+  enabled: z.boolean().optional(),
+  language: z.enum(LANGUAGE_SETTINGS).optional(),
+  gatewayUrl: textInput.optional(),
+  gatewayModel: textInput.optional(),
+  fallbackModel: z.string().trim().min(1).max(200).optional(),
+  systemPrompt: promptInput.optional(),
+  dailyLimit: dailyLimitInput.optional(),
+  resetTodayCount: z.boolean().optional(),
+  clearCooldowns: z.boolean().optional(),
+});
+export type SetBriefingConfig = z.infer<typeof setBriefingConfigSchema>;
+
+/** setBriefingConfig 的字段 → 设置页补丁（两套名字指向同一份 bb.settings） */
+export function briefingConfigToPatch(input: SetBriefingConfig): SettingsPatch {
+  const patch: SettingsPatch = {};
+  if (input.enabled !== undefined) patch.briefingEnabled = input.enabled;
+  if (input.language !== undefined) patch.briefingLanguage = input.language;
+  if (input.gatewayUrl !== undefined) patch.briefingGatewayUrl = input.gatewayUrl;
+  if (input.gatewayModel !== undefined) patch.briefingGatewayModel = input.gatewayModel;
+  if (input.fallbackModel !== undefined) patch.briefingModel = input.fallbackModel;
+  if (input.systemPrompt !== undefined) patch.briefingSystemPrompt = input.systemPrompt;
+  if (input.dailyLimit !== undefined) patch.briefingDailyLimit = input.dailyLimit;
+  if (input.resetTodayCount !== undefined) patch.resetTodayCount = input.resetTodayCount;
+  if (input.clearCooldowns !== undefined) patch.clearCooldowns = input.clearCooldowns;
+  return patch;
+}
+
 /** 设置页的插件状态快照 */
 export const settingsStatusSchema = z.object({
+  values: settingsValuesSchema,
+  /** 内置提示词（设置页“填入默认”用） */
+  defaultPrompts: z.object({ en: z.string(), zh: z.string() }),
   language: z.enum(LANGUAGE_SETTINGS),
   /** 速览实际用的语言（auto 时是前端报上来的界面语言） */
   briefingLanguage: z.enum(["en", "zh"]),
@@ -196,13 +294,31 @@ export const serverContract = defineRpcContract({
   },
   /** 设置页改设置：写进 bb.settings（与声明式设置、bb plugin config 同一份），返回最新状态 */
   updateSettings: {
-    input: z.object({ language: z.enum(LANGUAGE_SETTINGS).optional(), briefingEnabled: z.boolean().optional() }),
+    input: settingsPatchSchema,
     output: settingsStatusSchema,
+  },
+  /** 别的插件（session-cockpit）读速览配置；只读 */
+  briefingConfig: {
+    input: z.object({}).optional(),
+    output: briefingConfigSchema,
+  },
+  /** 别的插件改速览配置：写进同一份 bb.settings，或执行清零 / 清冷却；返回最新配置 */
+  setBriefingConfig: {
+    input: setBriefingConfigSchema,
+    output: briefingConfigSchema,
   },
   /** 设置页手动恢复：清网关冷却与失败重试的冷却，然后补写一遍；返回最新状态 */
   resetBriefingCooldowns: {
     input: z.object({}),
     output: settingsStatusSchema,
+  },
+  /**
+   * 手动重新生成一条对话的速览（悬停卡片与 session-cockpit 的 Progress 都可以调用）：不看是否已是新的，立即按当前配置重写。
+   * status 说明结果，调用方据此按自己的语言提示：written / disabled / empty / unavailable / limit / failed（error 是英文原因，只供日志）。
+   */
+  regenerateBriefing: {
+    input: z.object({ threadId: z.string().min(1) }),
+    output: regenerateResultSchema,
   },
   /** 前端报告它解析出的界面语言（设置为 auto 时由浏览器语言决定）；服务端据此决定 auto 模式下速览用哪种语言 */
   reportLanguage: {

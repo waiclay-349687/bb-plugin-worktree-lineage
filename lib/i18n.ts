@@ -1,6 +1,6 @@
 /**
  * [INPUT]: 无外部依赖（纯数据 + 纯函数）
- * [OUTPUT]: 对外提供 Lang / LanguageSetting 类型、LANGUAGE_SETTINGS、LANGUAGE_OPTION_LABELS、resolveLanguage（auto / en / zh → en | zh）、MESSAGES（界面全部文案，en 与 zh 两本同构词典）、SETTINGS_TEXT（服务端设置项的英文标签与说明，bb 设置页不能随语言切换）、relativeTime / agoText（按语言的短相对时间、多久以前）、LANGUAGE_STORAGE_KEY
+ * [OUTPUT]: 对外提供 Lang / LanguageSetting 类型、LANGUAGE_SETTINGS、LANGUAGE_OPTION_LABELS、resolveLanguage（auto / en / zh → en | zh）、MESSAGES（界面全部文案，en 与 zh 两本同构词典）、SETTINGS_TEXT（服务端设置项的英文标签与说明，bb 设置页不能随语言切换）、relativeTime / agoText（按语言的短相对时间、多久以前）、regenerateText（手动重新生成的结果说明）、LANGUAGE_STORAGE_KEY
  * [POS]: lib 的界面语言层; 消费者: components/i18n.tsx（解析语言、提供 useT）、app.tsx（槽位与设置分区的标题）、components/settings-section.tsx（设置面板）、server.ts（设置项标签）、lib/view.ts（相对时间）; 与 lib/briefing.ts 的边界: 这里只管界面文案，交给模型的提示词按语言放在 briefing
  * [PROTOCOL]: 变更时更新此头部,然后检查所在目录 CLAUDE.md
  *
@@ -145,6 +145,14 @@ const en = {
   behindByAsks: ((n) => (n === 1 ? "The stages above were written 1 turn ago and update after this turn" : `The stages above were written ${n} turns ago and update after this turn`)) as Count,
   behindLatestReply: "The stages above predate the latest reply and update after this turn",
   branchFrom: ((parent) => ` from ${parent}`) as Text,
+  regenerate: "Regenerate briefing",
+  regenerating: "Regenerating…",
+  regenerated: "Briefing updated",
+  regenDisabled: "Briefings are turned off in settings",
+  regenEmpty: "Nothing to summarize yet",
+  regenUnavailable: "Can't reach this thread's machine",
+  regenLimit: "Today's briefing limit is used up",
+  regenFailed: "No model could write the briefing",
 
   // 相对时间
   timeNow: "now",
@@ -193,6 +201,32 @@ const en = {
   setLoading: "Loading…",
   setLoadFailed: "Couldn't load the plugin status",
   setSaveFailed: "Couldn't save the setting",
+  setConfigurationHeading: "Configuration",
+  setInterface: "Interface",
+  setDefaultView: "Default view",
+  setPeek: "Hover card",
+  setPeekHint: "Shows the briefing card when the pointer rests on a thread.",
+  setPeekDelay: "Delay",
+  msUnit: "ms",
+  setBriefingLanguageHint: "Auto follows the interface language, so you can keep an English interface with Chinese briefings.",
+  languageAutoInterface: "Auto (follow interface)",
+  setGatewayUrl: "Gateway address",
+  setGatewayUrlHint: "An OpenAI-compatible gateway on this machine. Leave empty to use only the local Claude.",
+  setGatewayModels: "Gateway models",
+  setGatewayModelsHint: "Comma separated, tried in order.",
+  setFallbackModel: "Fallback Claude model",
+  setDailyLimit: "Daily limit",
+  setResetCount: "Reset today's count",
+  setPrompt: "Custom prompt",
+  setPromptHint: "Empty uses the built-in prompt. The required JSON output format is always appended, and briefings are rewritten after a change.",
+  setPromptPlaceholder: "Using the built-in prompt",
+  setPromptFillDefault: "Fill in default",
+  setPromptRestore: "Restore default",
+  setPromptLength: ((n, max: number) => `${n} / ${max} characters`) as (n: number, max: number) => string,
+  setSave: "Save",
+  setSaved: "Saved",
+  setInvalidNumber: ((min, max: number) => `Enter a whole number from ${min} to ${max}`) as (min: number, max: number) => string,
+  setRequired: "Can't be empty",
 };
 
 export type Messages = typeof en;
@@ -301,6 +335,14 @@ const zh: Messages = {
   behindByAsks: (n) => `上面的阶段写于 ${n} 轮之前，这一轮结束后更新`,
   behindLatestReply: "上面的阶段写于最新答复之前，这一轮结束后更新",
   branchFrom: (parent) => `，切自 ${parent}`,
+  regenerate: "重新生成速览",
+  regenerating: "正在重新生成…",
+  regenerated: "速览已更新",
+  regenDisabled: "速览已在设置中关闭",
+  regenEmpty: "还没有可总结的内容",
+  regenUnavailable: "连不上这条对话所在的机器",
+  regenLimit: "今天的速览次数已用完",
+  regenFailed: "没有模型写成速览",
 
   timeNow: "刚刚",
   timeMinutes: (n) => `${n}分钟`,
@@ -347,6 +389,32 @@ const zh: Messages = {
   setLoading: "读取中…",
   setLoadFailed: "读取插件状态失败",
   setSaveFailed: "设置保存失败",
+  setConfigurationHeading: "配置",
+  setInterface: "界面",
+  setDefaultView: "默认视图",
+  setPeek: "悬停卡片",
+  setPeekHint: "鼠标停在对话上时显示速览卡。",
+  setPeekDelay: "延迟",
+  msUnit: "毫秒",
+  setBriefingLanguageHint: "“自动”跟随界面语言；也可以界面用英文、速览用中文。",
+  languageAutoInterface: "自动（跟随界面）",
+  setGatewayUrl: "网关地址",
+  setGatewayUrlHint: "本机上的 OpenAI 兼容网关；留空则只用本机 Claude。",
+  setGatewayModels: "网关模型",
+  setGatewayModelsHint: "逗号分隔，按顺序尝试。",
+  setFallbackModel: "兜底 Claude 模型",
+  setDailyLimit: "每天上限",
+  setResetCount: "清零今天的次数",
+  setPrompt: "自定义提示词",
+  setPromptHint: "留空使用内置提示词；必需的 JSON 输出格式总会接在后面，改动后速览会重写。",
+  setPromptPlaceholder: "正在使用内置提示词",
+  setPromptFillDefault: "填入默认",
+  setPromptRestore: "恢复默认",
+  setPromptLength: (n, max) => `${n} / ${max} 字`,
+  setSave: "保存",
+  setSaved: "已保存",
+  setInvalidNumber: (min, max) => `请输入 ${min} 到 ${max} 的整数`,
+  setRequired: "不能为空",
 };
 
 export const MESSAGES: Record<Lang, Messages> = { en, zh };
@@ -363,6 +431,25 @@ export function relativeTime(at: number, now: number, lang: Lang): string {
   return days < 14 ? t.timeDays(days) : t.timeWeeks(Math.floor(days / 7));
 }
 
+/** 手动重新生成速览的结果 → 当前语言的一句话（regenerateBriefing 的 status） */
+export function regenerateText(tx: Messages, status: "written" | "disabled" | "empty" | "unavailable" | "limit" | "failed" | "skipped"): string {
+  switch (status) {
+    case "written":
+    case "skipped":
+      return tx.regenerated;
+    case "disabled":
+      return tx.regenDisabled;
+    case "empty":
+      return tx.regenEmpty;
+    case "unavailable":
+      return tx.regenUnavailable;
+    case "limit":
+      return tx.regenLimit;
+    case "failed":
+      return tx.regenFailed;
+  }
+}
+
 /** 多久以前：5m ago / 5分钟前；不到一分钟直接写 now / 刚刚 */
 export function agoText(at: number, now: number, lang: Lang): string {
   const time = relativeTime(at, now, lang);
@@ -373,7 +460,20 @@ export function agoText(at: number, now: number, lang: Lang): string {
  * 服务端设置项的标签与说明。设置页由 bb 渲染、schema 在插件启动时一次定下，不能随界面语言切换，
  * 所以固定用英文（与 BB 界面和同系列插件一致，英文 BB 的设置页里不出现汉字）；中文说明见 README.zh-CN.md。
  */
-export const SETTINGS_TEXT: Record<"language" | "briefingEnabled" | "briefingGatewayUrl" | "briefingGatewayModel" | "briefingModel", { label: string; description: string }> = {
+export const SETTINGS_TEXT: Record<
+  | "language"
+  | "briefingEnabled"
+  | "briefingLanguage"
+  | "briefingGatewayUrl"
+  | "briefingGatewayModel"
+  | "briefingModel"
+  | "briefingSystemPrompt"
+  | "briefingDailyLimit"
+  | "peekEnabled"
+  | "peekDelayMs"
+  | "defaultView",
+  { label: string; description: string }
+> = {
   language: {
     label: "Language",
     description: "Interface and briefing language. Auto follows the BB interface language (Chinese when BB is in Chinese, English otherwise); pick zh to use Chinese in an English BB.",
@@ -389,6 +489,30 @@ export const SETTINGS_TEXT: Record<"language" | "briefingEnabled" | "briefingGat
   briefingGatewayModel: {
     label: "Gateway models (in order)",
     description: "Model ids from the gateway's /v1/models, comma separated and tried in order (one is fine). A model that times out, errors or writes invalid output is skipped; a 429 cools that model down per Retry-After (15 min if missing, at most 25 min).",
+  },
+  briefingLanguage: {
+    label: "Briefing language",
+    description: "Language briefings are written in. Auto follows the interface language; pick zh to keep an English interface with Chinese briefings.",
+  },
+  briefingSystemPrompt: {
+    label: "Custom briefing prompt",
+    description: "Replaces the built-in system prompt when not empty. The required JSON output format is always appended. Changing it rewrites briefings.",
+  },
+  briefingDailyLimit: {
+    label: "Daily briefing limit",
+    description: "At most this many briefings per day (10 to 2000), a guard against runaway loops.",
+  },
+  peekEnabled: {
+    label: "Hover card",
+    description: "Show the briefing card when the pointer rests on a thread.",
+  },
+  peekDelayMs: {
+    label: "Hover card delay (ms)",
+    description: "How long the pointer rests on a thread before the card appears (100 to 1500).",
+  },
+  defaultView: {
+    label: "Default view",
+    description: "View the list opens in: conversations or branch-tree.",
   },
   briefingModel: {
     label: "Fallback Claude model",

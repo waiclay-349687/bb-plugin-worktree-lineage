@@ -3,7 +3,8 @@
 
 ## 成员清单
 i18n.tsx: 界面语言的 React 层。LanguageProvider 在列表根部解析一次语言（插件设置的实时值 > localStorage 镜像 > auto 时 BB 的 <html lang>、为空才看浏览器语言），把设置值镜像进 localStorage，并在挂载、语言变化、窗口获得焦点时经 reportLanguage 报给服务端；useT 取当前语言的词典（lineage-list 与 peek 里一律用 tx 取文案，tx 不和循环变量 t 撞名），readLanguageSync 给 app.tsx 注册时同步取语言
-settings-section.tsx: 插件设置页的 settingsSection 面板（自带 LanguageProvider，标题自己按当前语言画）。读 settingsStatus RPC 每 5 秒刷新；语言切换器（自动 / English / 简体中文，先 applyLanguageLocally 再 updateSettings）、速览开关（updateSettings）与状态（通道、速览语言、最近一条、今天次数 / 上限、冷却、等待重试、暂停，一键 resetBriefingCooldowns）、本机搁置数与“全部取消搁置”（只清 localStorage 并派发 SETTLED_CHANGED_EVENT）；样式在 ../styles.css 的 wl-set-* 类
+prefs.tsx: 侧边栏行为偏好。usePluginPrefs 给出悬停卡片开关、悬停延迟、默认视图（bb.settings 的值变了写进本机镜像；设置面板改了经 applyPrefsLocally + 事件立即生效；别的标签页经 storage 事件）；列表用它决定卡片出不出、等多久、打开时的视图（手动切过的视图优先，设置里改默认视图会清掉记住的选择）
+settings-section.tsx: 插件设置页的完整设置面板（自带 LanguageProvider，标题自己按当前语言画）。读 settingsStatus RPC 每 5 秒刷新；界面（语言切换、默认视图、悬停卡片开关与延迟）、悬停速览（开关、速览语言、网关地址与模型链、兜底模型、每天上限与清零、自定义提示词：多行编辑 + 填入默认 + 恢复默认 + 保存、运行状态与清冷却）、本机搁置数与“全部取消搁置”；所有改动走 updateSettings；文本框失焦 / 回车提交、正在编辑不被刷新覆盖，数字越界给按当前语言的提示且不提交；useHostSettingsChrome 藏起宿主生成的同名英文表单行并把 Configuration 标题与插件说明换成当前语言（卸载时还原）；样式在 ../styles.css 的 wl-set-* 类
 lineage-list.tsx: experimental_threadList 槽位组件。两个视图，各有主角（默认“对话”，记住上次的选择）：
   - 对话视图：ConversationItem。项目下面直接列对话，一条一行（provider 图标 + 标题 + 右侧两个固定槽：派出数量 / 状态或时间），不出现分支、worktree；被派出的对话缩进一格排在派它的对话下面，用细拐线连着，点派出数量整组收起（默认展开）；支持本地 Settle 软收起（悬停行尾 Settle / Unsettle 按钮，中文界面叫 搁置 / 取消搁置；项目底部 SettledFoot「Settled N」/「已搁置 N」架子，不触发 bb 归档也不删工作区，有新活动自动唤醒；项目计数只数主列表里的对话）；不显示空闲 worktree，不按“已合回”折叠
   - 分支树视图：BranchItem。分支是主行（图标 + 等宽分支名 + 右侧小字标记：主检出 / +领先提交数 / 已合回 / 无 worktree / bb 之外；悬停时标记原地换成“复制安全清理命令”“在此新建”和折叠按钮；清理命令只给 bb 之外（bb 没登记成环境）、没有对话在跑 / 等你 / 出错的空闲或已合回非主 worktree（bb 托管的 worktree 归 bb 管，绕过它删会留下悬空环境），形如 git -C <主检出> worktree remove <路径>，已合回再接 git branch -d，绝不带 --force / -D），它上面的对话是次级行（小一号、灰一档，按最近活动排；被派出的带一个“派自”小箭头，派出过对话的带“高亮它们”的数量槽），从它切出去的分支再缩进一格；项目页脚 ProjectFoot 收着“已合回 N · 空闲 worktree N”；没有 git 的项目照常列出对话、不画树
@@ -15,7 +16,7 @@ lineage-list.tsx: experimental_threadList 槽位组件。两个视图，各有�
   行的颜色三种（lib/view.ts 的 rowTone / rowColor）：输入框里有没发出去内容的对话（useSidebarThreadDraft）整行变黄并在行尾画 bb 的铅笔；等你回复、出错整行变蓝；完成未读整行变绿
   快速筛选：按 “/” 或点放大镜，顶栏变成输入框，候选分三组：标题或分支（本地即时匹配，lib/search.ts）→ 消息里提到（bb 官方搜索 sdk.threads.search，输入停顿 260ms 后请求）→ 已归档（同上）；同一条对话只出现在最靠前的一组；方向键跨组选择、回车打开、Esc 退出
   共用：对话行 = provider 图标 + 标题 + 状态；悬停时行尾原地换成快捷操作（在此 worktree 新建、bb 的 regenerateTitle / archive、更多菜单），排在文档流里所以不会盖住折叠按钮；项目页脚收纳已合回与空闲 worktree；45s 轮询且仅在页面可见时
-peek.tsx: 悬停预览卡 Peek（380px 宽）。内容一次取回（briefing RPC：存盘的速览 + 是否落后 + 兜底摘要）。有速览时：一句话概括 + 竖排的阶段轨道（已完成 / 进行中 / 已放弃，各带一句结论）+ 现在 / 等你 / 下一步；速览落后时阶段保留，后三行换成最新一轮的原话（你问 / 答复）并注明；没有速览时只显示原话。进展行（轮数、派出的对话里不空闲的、PR、改动行数）和底部（分支与起点、派自谁）来自 bb 已有数据。卡片自己从不触发模型调用。
+peek.tsx: 悬停预览卡 Peek（380px 宽）。内容一次取回（briefing RPC：存盘的速览 + 是否落后 + 兜底摘要）。有速览时：一句话概括 + 竖排的阶段轨道（已完成 / 进行中 / 已放弃，各带一句结论）+ 现在 / 等你 / 下一步；速览落后时阶段保留，后三行换成最新一轮的原话（你问 / 答复）并注明；没有速览时只显示原话。进展行（轮数、派出的对话里不空闲的、PR、改动行数）和底部（分支与起点、派自谁）来自 bb 已有数据。卡片自己从不触发模型调用。；标题右侧有“重新生成速览”小按钮（调用 regenerateBriefing，进行中图标转圈，结果按当前语言留在卡片底部，成功后重读存盘速览）
   共享元素过渡：Peek 是取数层，新对话的内容取回之前继续画旧的（不会先缩成只剩标题）；PeekCard 是同一张卡片，位置和高度一起做 CSS 过渡，换人时把上一条画出来的样子留在一层残影里淡出、新内容同时淡入。卡片可以进入：pointer-events 开着、文字可选中复制、用文字光标。渲染到 document.body，因为侧边栏有自己的层叠上下文
 motion.tsx: 动效基础层。usePresenceList 同步合并进入/退场状态并挂兜底定时器；MotionRow 负责双 rAF 新行高度撑开与归档高度收起；useFlipContainer 基于滚动无关坐标与 WAAPI 驱动重排与跨区置顶滑移
 icons.tsx: 自绘的 16 格线性图标 Glyph（宿主图标表不含完整 lucide，缺名会回退成闪电，所以不依赖它）

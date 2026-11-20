@@ -5,7 +5,7 @@ import type { OutlineItem } from "../lib/search";
 
 const HAN = /[一-鿿]/;
 /** 中文界面里允许出现的英文：专有名词（含产品名 Claude）与按键名，别的英文词一律不许出现 */
-const ZH_ALLOWED_WORDS = new Set(["Git", "BB", "HEAD", "Alt", "Option", "Claude"]);
+const ZH_ALLOWED_WORDS = new Set(["Git", "BB", "HEAD", "Alt", "Option", "Claude", "OpenAI", "JSON"]);
 /** 用户点名要防的“英文界面词”，单独再查一遍，失败时信息更直观 */
 const ZH_BANNED = /Settled|Settle|Unsettle|worktree|Conversation|Branch|Tree|Merged|Idle|Outside|Main checkout|\bPR\b|\bfrom\b|\bnow\b/i;
 
@@ -17,7 +17,7 @@ function render(messages: Messages, sample: string): string[] {
     if (key === "childPart") return (value as Messages["childPart"])(2, messages.childDone);
     if (key === "pullRequest") return (value as Messages["pullRequest"])(12, messages.prMerged);
     const fn = value as (a: unknown, b?: unknown) => string;
-    if (/^(time|turns|uncommitted|behind|fold|foot|nodeAhead|attention|highlight|setToday|setQueue|setRetry|settledCount)/.test(key)) return fn(3, 300);
+    if (/^(time|turns|uncommitted|behind|fold|foot|nodeAhead|attention|highlight|setToday|setQueue|setRetry|settledCount|setPromptLength|setInvalidNumber)/.test(key)) return fn(3, 300);
     return fn(sample, sample);
   });
 }

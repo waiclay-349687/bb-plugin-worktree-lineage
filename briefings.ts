@@ -1,11 +1,11 @@
 /**
  * [INPUT]: 依赖 bb.sdk.threads（对话大纲、列表）与 bb.sdk.environments（对话在哪台机器）、bb.events 的 thread.idle / thread.deleted、bb.storage.kv 存盘、bb.log 记录命中的通道与跳过 / 失败的网关模型、调用方注入的 callModel（经 host.ts 的 writeBriefing 调网关或本机 claude）; 依赖 lib/briefing 的提要与解析
- * [OUTPUT]: 对外提供 createBriefingService(bb, callModel, getSettings): { view(threadId), backfill(), status()（设置页的运行状态快照）, resetCooldowns()（清冷却后补写） } — 在后台为每条对话写“全程速览”并存盘；view 给界面一次性取回速览、是否落后、兜底摘要（只读）; generateBriefing(callModel, hostId, request, settings, cooldowns, now): 按顺序试网关模型链（按 settings.language 校验输出）（跳过冷却中的）、全不行再兜底本机 claude 的一次生成（不依赖 bb，可单测）; parseModelList: 逗号分隔的有序模型列表; summarizeCooldowns: 冷却表 → 设置页清单; BriefingStatus 类型; CooldownTable / GatewayStep 类型
+ * [OUTPUT]: 对外提供 createBriefingService(bb, callModel, getSettings): { view(threadId), backfill(), status()（设置页的运行状态快照）, resetCooldowns()（清冷却后补写）, resetTodayCount()（清零今天的计数）, spentToday(), regenerate(threadId)（手动重新生成：不看是否已是新的，立即按当前配置重写，返回结果） }; RegenerateResult / RegenerateStatus 类型 — 在后台为每条对话写“全程速览”并存盘；view 给界面一次性取回速览、是否落后、兜底摘要（只读）; generateBriefing(callModel, hostId, request, settings, cooldowns, now): 按顺序试网关模型链（按 settings.language 校验输出）（跳过冷却中的）、全不行再兜底本机 claude 的一次生成（不依赖 bb，可单测）; parseModelList: 逗号分隔的有序模型列表; summarizeCooldowns: 冷却表 → 设置页清单; BriefingStatus 类型; CooldownTable / GatewayStep 类型
  * [POS]: 插件服务端的速览调度; 消费者: server.ts; 与 lib/briefing.ts 的边界: 这里决定“何时写、写哪条、用哪种语言写、按什么顺序走哪条通道、哪个网关模型在冷却、写完存哪”（语言和当前界面不一致的存盘速览既不显示、也算落后要重写），提示词与输出校验在 briefing; 与 host.ts 的边界: 这里不执行任何命令，回退决策在这里、执行在 host
  * [PROTOCOL]: 变更时更新此头部,然后检查项目根 CLAUDE.md
  */
 import type { BbPluginApi } from "@get-bb/plugin-sdk";
-import { BRIEFING_VERSION, briefingLanguage, briefingSystemPrompt, buildDigest, countAsks, freshness, outlineKey, parseBriefing, storedBriefingSchema, type Briefing, type StoredBriefing } from "./lib/briefing";
+import { BRIEFING_VERSION, briefingLanguage, briefingSystemPrompt, buildDigest, promptFingerprint, countAsks, freshness, outlineKey, parseBriefing, storedBriefingSchema, type Briefing, type StoredBriefing } from "./lib/briefing";
 import type { Lang } from "./lib/i18n";
 import type { ModelRunResult } from "./lib/model-run";
 import type { BriefingView, ModelRoute } from "./lib/contract";
@@ -22,6 +22,10 @@ export interface BriefingSettings {
   model: string;
   /** 优先使用的 OpenAI 兼容网关与其上按顺序尝试的模型；null = 不走网关，直接用 claude */
   gateway: { baseUrl: string; models: string[] } | null;
+  /** 自定义系统提示词；空串 = 用内置的 */
+  systemPrompt: string;
+  /** 每天最多写几次 */
+  dailyLimit: number;
 }
 
 /** 把“逗号分隔的有序模型列表”解析成数组（兼容只写一个模型名、中文逗号与换行）；去重，空则用 fallback */
@@ -136,6 +140,20 @@ export function summarizeCooldowns(table: ReadonlyMap<string, number>, now: numb
   return [...latest].map(([model, until]) => ({ model, until })).sort((a, b) => a.until - b.until);
 }
 
+/**
+ * 一次写速览的结果。status：written 写好了；disabled 速览开关关着；empty 对话还没有可总结的内容；
+ * unavailable 对话没有环境或所在机器不可达；limit 今天的次数用完了；failed 网关与本机 claude 都没写成（error 里是原因）；
+ * skipped 后台排队时发现不必写（已是新的等），手动重新生成不会返回它。
+ */
+export type RegenerateStatus = "written" | "disabled" | "empty" | "unavailable" | "limit" | "failed" | "skipped";
+export interface RegenerateResult {
+  ok: boolean;
+  status: RegenerateStatus;
+  briefing: StoredBriefing | null;
+  error?: string;
+}
+const SKIPPED: RegenerateResult = { ok: false, status: "skipped", briefing: null };
+
 /** 设置页上的速览运行状态（只读快照） */
 export interface BriefingStatus {
   spentToday: number;
@@ -168,8 +186,6 @@ const SPEND_KEY = "briefing-spend";
 const BACKFILL_WINDOW_MS = 14 * 24 * 60 * 60 * 1000;
 const BACKFILL_LIMIT = 40;
 const BACKFILL_DELAY_MS = 8_000;
-/** 每天最多写这么多次：防止意外的循环把额度烧掉 */
-const DAILY_LIMIT = 300;
 /** 同一条对话在同一进度（大纲指纹相同）上失败后，过这么久才再试 */
 const RETRY_AFTER_MS = 60 * 60 * 1000;
 
@@ -185,6 +201,7 @@ export function createBriefingService(bb: BbPluginApi, callModel: CallModel, get
   const cooldowns: CooldownTable = new Map();
   let consecutiveFailures = 0;
   let pausedAt: number | null = null;
+  const inflight = new Map<string, Promise<RegenerateResult>>();
   let last: BriefingStatus["last"] = null;
 
   async function read(threadId: string): Promise<StoredBriefing | null> {
@@ -203,7 +220,8 @@ export function createBriefingService(bb: BbPluginApi, callModel: CallModel, get
       getSettings(),
     ]);
     // 换了界面语言之后，旧语言写的速览不拿出来（不然就是另一种语言混进界面）；卡片先用兜底摘要，下一轮按新语言重写
-    const usable = stored && briefingLanguage(stored) === settings.language ? stored : null;
+    // 输出里总带上 language（旧速览缺这个字段时补上），别的插件按语言匹配展示
+    const usable = stored && briefingLanguage(stored) === settings.language ? { ...stored, language: briefingLanguage(stored) } : null;
     return {
       briefing: usable,
       freshness: usable ? freshness(usable, outline) : null,
@@ -213,47 +231,66 @@ export function createBriefingService(bb: BbPluginApi, callModel: CallModel, get
   }
 
   /** 当天已写次数；超过上限返回 false */
-  async function spend(): Promise<boolean> {
+  async function spend(limit: number): Promise<boolean> {
     const record = (await bb.storage.kv.get<{ day: string; count: number }>(SPEND_KEY)) ?? { day: today(), count: 0 };
     const count = record.day === today() ? record.count : 0;
-    if (count >= DAILY_LIMIT) return false;
+    if (count >= limit) return false;
     await bb.storage.kv.set(SPEND_KEY, { day: today(), count: count + 1 });
     return true;
   }
 
-  async function write(threadId: string): Promise<void> {
+  /**
+   * 写一条速览。后台（force = false）遇到这些情况直接跳过：速览已是新的、刚失败过还在重试冷却、对话还在跑、隐藏或已归档；
+   * 用户手动“重新生成”（force = true）不看这些，立即按当前配置重写。两种都尊重开关、每天上限，并返回结果说明发生了什么。
+   * 同一条对话同时只写一份：正在写时再来一次（后台排队或用户连点）直接复用那一次的结果。
+   */
+  function write(threadId: string, force = false): Promise<RegenerateResult> {
+    const running = inflight.get(threadId);
+    if (running) return running;
+    const job = produce(threadId, force).finally(() => inflight.delete(threadId));
+    inflight.set(threadId, job);
+    return job;
+  }
+
+  async function produce(threadId: string, force: boolean): Promise<RegenerateResult> {
     const settings = await getSettings();
-    if (!settings.enabled) return;
+    if (!settings.enabled) return { ok: false, status: "disabled", briefing: null };
 
     const thread = (await bb.sdk.threads.get({ threadId })) as unknown as ThreadRecord;
-    // 隐藏对话是别的插件的后台工作，侧边栏里看不到；已归档的不再有人悬停
-    if (thread.archivedAt || (thread.visibility && thread.visibility !== "visible")) return;
-    // 还在跑的对话等它停下来再写：thread.idle 会再触发一次
-    if (thread.status === "active" || thread.status === "starting") return;
-    if (!thread.environmentId) return;
+    const active = thread.status === "active" || thread.status === "starting";
+    if (!force) {
+      // 隐藏对话是别的插件的后台工作，侧边栏里看不到；已归档的不再有人悬停
+      if (thread.archivedAt || (thread.visibility && thread.visibility !== "visible")) return SKIPPED;
+      // 还在跑的对话等它停下来再写：thread.idle 会再触发一次
+      if (active) return SKIPPED;
+    }
+    if (!thread.environmentId) return { ok: false, status: "unavailable", briefing: null, error: "thread has no environment" };
 
     const outline = (await bb.sdk.threads.conversationOutline({ threadId })) as unknown as { items: OutlineItem[] };
     const askCount = countAsks(outline.items);
-    if (askCount === 0) return;
+    if (askCount === 0) return { ok: false, status: "empty", briefing: null };
 
     // 任何新消息都算新进展：不只是新要求，子对话回报之后的续写也要重写
     const key = outlineKey(outline.items);
-    const stored = await read(threadId);
-    if (stored && freshness(stored, outline.items, settings.language).state === "fresh") return;
-    const lastFailure = failed.get(threadId);
-    if (lastFailure && lastFailure.key === key && Date.now() - lastFailure.at < RETRY_AFTER_MS) return;
+    const promptKey = promptFingerprint(settings.systemPrompt);
+    if (!force) {
+      const stored = await read(threadId);
+      if (stored && freshness(stored, outline.items, settings.language, promptKey).state === "fresh") return SKIPPED;
+      const lastFailure = failed.get(threadId);
+      if (lastFailure && lastFailure.key === key && Date.now() - lastFailure.at < RETRY_AFTER_MS) return SKIPPED;
+    }
 
     const environment = (await bb.sdk.environments.get({ environmentId: thread.environmentId })) as unknown as { hostId?: string | null };
-    if (!environment.hostId) return;
-    if (!(await spend())) {
-      bb.log.warn(`briefing daily limit (${DAILY_LIMIT}) reached; skipping ${threadId}`);
-      return;
+    if (!environment.hostId) return { ok: false, status: "unavailable", briefing: null, error: "environment has no host" };
+    if (!(await spend(settings.dailyLimit))) {
+      bb.log.warn(`briefing daily limit (${settings.dailyLimit}) reached; skipping ${threadId}`);
+      return { ok: false, status: "limit", briefing: null, error: `daily limit ${settings.dailyLimit} reached` };
     }
 
     const outcome = await generateBriefing(
       callModel,
       environment.hostId,
-      { system: briefingSystemPrompt(settings.language), prompt: buildDigest(outline.items, { active: false, language: settings.language }) },
+      { system: briefingSystemPrompt(settings.language, settings.systemPrompt), prompt: buildDigest(outline.items, { active, language: settings.language }) },
       settings,
       cooldowns,
     );
@@ -265,21 +302,35 @@ export function createBriefingService(bb: BbPluginApi, callModel: CallModel, get
     }
     const skipped = outcome.steps.flatMap((step) => (step.kind === "cooling" ? [`${step.model} (${span(step.until - Date.now())} left)`] : []));
     const skippedNote = skipped.length > 0 ? `; skipped while cooling: ${skipped.join(", ")}` : "";
+    const how = force ? " (manual)" : "";
     if (outcome.status === "failed") {
       failed.set(threadId, { key, at: Date.now() });
-      consecutiveFailures += 1;
+      if (!force) consecutiveFailures += 1;
       last = { status: "failed", at: Date.now() };
-      bb.log.warn(`briefing failed for ${threadId} (claude ${settings.model}): ${outcome.message}${skippedNote}`);
-      return;
+      bb.log.warn(`briefing failed for ${threadId}${how} (claude ${settings.model}): ${outcome.message}${skippedNote}`);
+      return { ok: false, status: "failed", briefing: null, error: outcome.message };
     }
     failed.delete(threadId);
     consecutiveFailures = 0;
     pausedAt = null;
     last = { status: "ok", via: outcome.via, model: outcome.model, at: Date.now() };
-    await bb.storage.kv.set(KEY(threadId), { ...outcome.briefing, version: BRIEFING_VERSION, language: settings.language, outlineKey: key, askCount, generatedAt: Date.now() } satisfies StoredBriefing);
+    const stored: StoredBriefing = { ...outcome.briefing, version: BRIEFING_VERSION, language: settings.language, promptKey, outlineKey: key, askCount, generatedAt: Date.now() };
+    await bb.storage.kv.set(KEY(threadId), stored);
     const cost = outcome.costUsd === null ? "" : `, $${outcome.costUsd}`;
     const fallback = outcome.steps.length > 0 ? " (fallback)" : "";
-    bb.log.info(`briefing written for ${threadId} via ${outcome.via} ${outcome.model}${fallback} (${askCount} asks, ${outcome.durationMs}ms${cost})${skippedNote}`);
+    bb.log.info(`briefing written for ${threadId}${how} via ${outcome.via} ${outcome.model}${fallback} (${askCount} asks, ${outcome.durationMs}ms${cost})${skippedNote}`);
+    return { ok: true, status: "written", briefing: stored };
+  }
+
+  /** 用户手动重新生成一条对话的速览：不看是否已是新的，立即按当前配置重写；结果里说明成功或为什么没写成 */
+  async function regenerate(threadId: string): Promise<RegenerateResult> {
+    try {
+      const first = await write(threadId, true);
+      // 正好碰上后台在写这条（复用了它的结果）而后台判断“不必写”：那不是用户要的，再强制写一次
+      return first.status === "skipped" ? await write(threadId, true) : first;
+    } catch (error) {
+      return { ok: false, status: "failed", briefing: null, error: error instanceof Error ? error.message : String(error) };
+    }
   }
 
   /** 一次只写一条：小模型调用走用户的订阅额度，不并发抢占 */
@@ -329,11 +380,16 @@ export function createBriefingService(bb: BbPluginApi, callModel: CallModel, get
   });
 
   /** 设置页用的运行状态快照（只读，不触发任何生成） */
-  async function status(): Promise<BriefingStatus> {
+  async function spentToday(): Promise<number> {
     const record = await bb.storage.kv.get<{ day: string; count: number }>(SPEND_KEY);
+    return record?.day === today() ? record.count : 0;
+  }
+
+  async function status(): Promise<BriefingStatus> {
+    const settings = await getSettings();
     return {
-      spentToday: record?.day === today() ? record.count : 0,
-      dailyLimit: DAILY_LIMIT,
+      spentToday: await spentToday(),
+      dailyLimit: settings.dailyLimit,
       queued: queue.length,
       working,
       cooldowns: summarizeCooldowns(cooldowns, Date.now()),
@@ -352,5 +408,10 @@ export function createBriefingService(bb: BbPluginApi, callModel: CallModel, get
     await backfill();
   }
 
-  return { view, backfill, status, resetCooldowns };
+  /** 用户在设置页手动清零今天的计数（上限防的是意外循环；用户确认后再给一天的额度） */
+  async function resetTodayCount(): Promise<void> {
+    await bb.storage.kv.set(SPEND_KEY, { day: today(), count: 0 });
+  }
+
+  return { view, backfill, status, resetCooldowns, resetTodayCount, spentToday, regenerate };
 }

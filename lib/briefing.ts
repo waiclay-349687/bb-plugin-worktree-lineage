@@ -1,6 +1,6 @@
 /**
  * [INPUT]: 依赖 zod; 依赖 lib/search 的 plainSnippet（把大纲预览压成纯文字）; 依赖 lib/i18n 的 Lang 类型
- * [OUTPUT]: 对外提供 toTurns / countAsks（把 bb 的对话大纲切成“一轮要求 + 结论”）、outlineKey / freshness / briefingLanguage（存盘的速览是否落后于当前大纲与界面语言）、buildDigest（按语言拼喂给模型的全程提要）、briefingSystemPrompt（en / zh 两版提示词）、parseBriefing（按语言校验并截短模型输出）、briefingSchema 与 Briefing 类型
+ * [OUTPUT]: 对外提供 toTurns / countAsks（把 bb 的对话大纲切成“一轮要求 + 结论”）、outlineKey / freshness / briefingLanguage（存盘的速览是否落后于当前大纲、速览语言与提示词）、buildDigest（按语言拼喂给模型的全程提要）、briefingSystemPrompt（内置 en / zh 两版，或自定义提示词 + 不可改的输出约束）、defaultSystemPrompt、promptFingerprint（自定义提示词的短指纹）、parseBriefing（按语言校验并截短模型输出）、briefingSchema 与 Briefing 类型
  * [POS]: lib 的“全程速览”纯逻辑; 消费者: briefings.ts（服务端生成）、components/peek.tsx（判断速览是否落后）; 与 search.ts 的边界: search 的 buildRecap 是不花 token 的兜底摘要，这里是交给模型写的那一份的输入与输出
  * [PROTOCOL]: 变更时更新此头部,然后检查所在目录 CLAUDE.md
  */
@@ -44,6 +44,8 @@ export type BriefingStage = Briefing["stages"][number];
 export const storedBriefingSchema = briefingSchema.extend({
   version: z.number(),
   language: z.enum(["en", "zh"]).optional(),
+  /** 写的时候用的自定义提示词的指纹；没有自定义（用内置提示词）时为空串或缺省 */
+  promptKey: z.string().optional(),
   outlineKey: z.string(),
   askCount: z.number(),
   generatedAt: z.number(),
@@ -104,8 +106,15 @@ export const briefingLanguage = (stored: Pick<StoredBriefing, "language">): Lang
  * 存盘的速览相对当前大纲是否落后。服务端据此决定要不要重写，卡片据此决定“现在 / 等你 / 下一步”还能不能信。
  * 传了 language 时，语言不一致也算落后（newAsks 为 0）：换了界面语言，下一次就按新语言重写。
  */
-export function freshness(stored: Pick<StoredBriefing, "version" | "outlineKey" | "askCount" | "language">, items: readonly OutlineItem[], language?: Lang): Freshness {
+export function freshness(
+  stored: Pick<StoredBriefing, "version" | "outlineKey" | "askCount" | "language" | "promptKey">,
+  items: readonly OutlineItem[],
+  language?: Lang,
+  promptKey?: string,
+): Freshness {
   if (language !== undefined && briefingLanguage(stored) !== language) return { state: "behind", newAsks: 0 };
+  // 换了自定义提示词（或从自定义换回内置）：按新提示词重写
+  if (promptKey !== undefined && (stored.promptKey ?? "") !== promptKey) return { state: "behind", newAsks: 0 };
   if (stored.version === BRIEFING_VERSION && stored.outlineKey === outlineKey(items)) return { state: "fresh" };
   return { state: "behind", newAsks: Math.max(0, countAsks(items) - stored.askCount) };
 }
@@ -179,9 +188,44 @@ Rules:
 - This is written for the reader themselves: address them as "you" (for example "waiting for you to pick a direction"), never "the user"
 - Write every field in plain English only, with no Chinese characters, even if the conversation is in another language; keep code identifiers, file names and branch names as they are`;
 
-/** 交给模型的系统提示词：所选语言写所有字段（中文版沿用原来的提示词） */
-export function briefingSystemPrompt(language: Lang): string {
+/** 内置的系统提示词（设置页“填入默认”给的就是它） */
+export function defaultSystemPrompt(language: Lang): string {
   return language === "en" ? EN_SYSTEM_PROMPT : ZH_SYSTEM_PROMPT;
+}
+
+/**
+ * 自定义提示词后面一定接上的输出约束：结构与字段名是 parseBriefing 的契约，用户改提示词也不能把它改掉；
+ * 语言要求也放在这里，保证速览按所选语言写。
+ */
+const OUTPUT_CONTRACT: Record<Lang, string> = {
+  en: `Whatever the instructions above say, the output must follow this contract:
+- Output exactly one JSON object, with no explanation and no code fence
+- Fields: {"about": string, "stages": [{"title": string, "state": "done" | "doing" | "dropped", "note": string}], "now": string, "waiting": string | null, "next": string | null}
+- 1 to 6 stages in time order; write null for "waiting" or "next" when there is nothing
+- Write every field in plain English only, with no Chinese characters; keep code identifiers, file names and branch names as they are`,
+  zh: `不管上面怎么要求，输出都必须遵守这个约定：
+- 只输出一个 JSON 对象，不要解释、不要代码围栏
+- 字段：{"about": 字符串, "stages": [{"title": 字符串, "state": "done" | "doing" | "dropped", "note": 字符串}], "now": 字符串, "waiting": 字符串或 null, "next": 字符串或 null}
+- stages 按时间顺序 1 到 6 个；没有要等的或不确定下一步时写 null
+- 所有字段一律用简体中文写；代码标识符、文件名、分支名保持原样`,
+};
+
+/** 交给模型的系统提示词：没有自定义时用内置的；有自定义时用用户的话，后面接上不可改的输出约束 */
+export function briefingSystemPrompt(language: Lang, custom = ""): string {
+  const text = custom.trim();
+  return text === "" ? defaultSystemPrompt(language) : `${text}\n\n${OUTPUT_CONTRACT[language]}`;
+}
+
+/** 自定义提示词的短指纹（FNV-1a 32 位）：存进速览，提示词一变就知道要重写；内置提示词为空串 */
+export function promptFingerprint(custom: string): string {
+  const text = custom.trim();
+  if (text === "") return "";
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < text.length; i += 1) {
+    hash ^= text.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193) >>> 0;
+  }
+  return hash.toString(16).padStart(8, "0");
 }
 
 const clip = (text: string, max: number) => {
