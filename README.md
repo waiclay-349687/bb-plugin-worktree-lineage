@@ -1,3 +1,12 @@
+> [!IMPORTANT]
+> **This repository has moved to [waiclay-349687/bb-plugins](https://github.com/waiclay-349687/bb-plugins/tree/main/plugins/worktree-lineage) and is archived (read-only).** New releases, issues and pull requests live there, in `plugins/worktree-lineage`. Install from the monorepo:
+>
+> ```sh
+> bb plugin install git:https://github.com/waiclay-349687/bb-plugins.git --plugin worktree-lineage --yes
+> ```
+>
+> Installed from a local clone of this repository? Clone bb-plugins and run `bb plugin install "path:$PWD" --plugin worktree-lineage --yes` in its root. bb moves the plugin to the new folder and keeps its settings.
+
 # Worktree Lineage
 
 > **English** | [简体中文](README.zh-CN.md)
